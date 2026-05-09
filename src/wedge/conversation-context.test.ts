@@ -6,7 +6,7 @@ import { buildWedgeSystemPrompt } from "./prompt.js";
 import { openWedgeDatabase } from "./storage.js";
 
 describe("Wedge short-term conversation context", () => {
-  it("injects recent channel logs into the system prompt", () => {
+  it("injects recent channel logs into the structured system prompt", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-context-"));
     const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
     try {
@@ -15,24 +15,44 @@ describe("Wedge short-term conversation context", () => {
       db.insertLog({
         messageId: "m1",
         channelId: "c1",
+        channelName: "test",
         userId: "u1",
+        userName: "Tester",
         content: "お礼を渡す",
         kind: "message",
       });
       db.insertLog({
         messageId: "m2",
         channelId: "c1",
+        channelName: "test",
         userId: "u1",
+        userName: "Tester",
         content: "それでお願い",
         kind: "message",
       });
 
-      const prompt = buildWedgeSystemPrompt({ db, channelId: "c1" });
+      const prompt = buildWedgeSystemPrompt({
+        db,
+        context: {
+          iteration: 1,
+          trigger: {
+            kind: "local_chat",
+            channelId: "c1",
+            channelName: "test",
+            userId: "u1",
+            userName: "Tester",
+            text: "それでお願い",
+          },
+        },
+      });
 
-      expect(prompt).toContain("[短期ログコンテキスト]");
+      expect(prompt).toContain("[persona]");
+      expect(prompt).toContain("[rules]");
+      expect(prompt).toContain("[context_json]");
+      expect(prompt).toContain("short_term_logs");
       expect(prompt).toContain("お礼を渡す");
       expect(prompt).toContain("それでお願い");
-      expect(prompt).toContain("speaker=ニンゲン");
+      expect(prompt).toContain('"call_sign": "ニンゲン"');
     } finally {
       db.close();
       fs.rmSync(dir, { recursive: true, force: true });

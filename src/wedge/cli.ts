@@ -1,7 +1,6 @@
-import { generateWedgeOllamaReply } from "./ollama.js";
-import { buildWedgeSystemPrompt } from "./prompt.js";
+import { runWedgeCognitionLoop } from "./cognition.js";
+import { runWedgeMemoryRecovery } from "./cron.js";
 import { openWedgeDatabase } from "./storage.js";
-import { triageWedgeMessage } from "./triage.js";
 
 export async function runWedgeCli(argv = process.argv.slice(2)): Promise<number> {
   const [command, arg, ...rest] = argv;
@@ -17,7 +16,7 @@ export async function runWedgeCli(argv = process.argv.slice(2)): Promise<number>
       return 0;
     }
     if (command === "force_memory_batch") {
-      console.log(JSON.stringify(db.runMemoryBatch(), null, 2));
+      console.log(JSON.stringify(await runWedgeMemoryRecovery(), null, 2));
       return 0;
     }
     if (command === "dump_nest") {
@@ -38,42 +37,35 @@ export async function runWedgeCli(argv = process.argv.slice(2)): Promise<number>
         messageId: `local-${Date.now()}`,
         channelId,
         userId,
+        userName: userId,
+        userIsBot: false,
         content: text,
         kind: "message",
+        metadataJson: JSON.stringify({ source: "local_chat" }),
       });
-      const state = db.getConversationState(channelId);
-      const now = Math.floor(Date.now() / 1000);
-      const recentLogs = db.listRecentLogs(channelId, 24);
-      const triage = triageWedgeMessage({ text, authorId: userId, state, recentLogs, now });
-      if (triage.action === "block" || triage.action === "bored") {
-        console.log(triage.reply);
-        return 0;
-      }
-      if (triage.flags.offeringSeen) {
-        db.upsertNestItem({
-          name: `供物:local-${Date.now()}`,
-          description: text.slice(0, 500),
-          quantity: 1,
-        });
-      }
-      db.setConversationState(channelId, { ...triage.statePatch, thinking: true });
+      db.setConversationState(channelId, { thinking: true });
       try {
-        const reply = await generateWedgeOllamaReply({
-          systemPrompt: buildWedgeSystemPrompt({
-            db,
+        await runWedgeCognitionLoop({
+          db,
+          trigger: {
+            kind: "local_chat",
+            messageId: `local-${Date.now()}`,
             channelId,
-            recentLogs,
-            conversationControl: triage.flags,
-          }),
-          userText: text,
-        });
-        console.log(reply);
-        db.insertLog({
-          messageId: `local-reply-${Date.now()}`,
-          channelId,
-          content: reply,
-          kind: "action",
-          metadataJson: JSON.stringify({ source: "local_chat" }),
+            userId,
+            userName: userId,
+            userIsBot: false,
+            text,
+          },
+          runtime: {
+            sendDiscordMessage: async ({ content }) => {
+              console.log(content);
+              return { printed: true };
+            },
+            addDiscordReaction: async ({ emoji }) => {
+              console.log(`[reaction] ${emoji}`);
+              return { printed: true };
+            },
+          },
         });
       } finally {
         db.setConversationState(channelId, { thinking: false });

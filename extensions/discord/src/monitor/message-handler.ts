@@ -6,7 +6,7 @@ import { danger, logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/runtime-group-policy";
 import { createDiscordRestClient } from "../client.js";
 import type { Client } from "../internal/discord.js";
-import { sendMessageDiscord } from "../send.js";
+import { reactMessageDiscord, sendMessageDiscord } from "../send.js";
 import { startWedgeDailyMemoryBatch } from "../../../../src/wedge/cron.js";
 import { runWedgeDiscordPrefilter } from "../../../../src/wedge/discord-prefilter.js";
 import {
@@ -288,12 +288,22 @@ export function createDiscordMessageHandler(
       }
       const wedgePrefilter = await runWedgeDiscordPrefilter({
         data,
-        sendReply: async (channelId, text) => {
-          await sendMessageDiscord(`channel:${channelId}`, text, {
-            cfg: params.cfg,
-            token: params.token,
-            accountId: params.accountId,
-          });
+        runtime: {
+          sendDiscordMessage: async ({ channelId, content, replyToMessageId }) => {
+            return await sendMessageDiscord(`channel:${channelId}`, content, {
+              cfg: params.cfg,
+              token: params.token,
+              accountId: params.accountId,
+              replyTo: replyToMessageId ?? undefined,
+            });
+          },
+          addDiscordReaction: async ({ channelId, messageId, emoji }) => {
+            return await reactMessageDiscord(channelId, messageId, emoji, {
+              cfg: params.cfg,
+              token: params.token,
+              accountId: params.accountId,
+            });
+          },
         },
       });
       if (wedgePrefilter.action !== "continue") {

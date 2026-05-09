@@ -1,9 +1,8 @@
 import { executeWedgeAdminCommand, parseWedgeAdminCommand } from "./admin.js";
+import { type WedgeActionRuntime } from "./actions.js";
 import { readAdminUserIds, readIgnoredChannelIds } from "./config.js";
-import { generateWedgeOllamaReply } from "./ollama.js";
-import { buildWedgeSystemPrompt } from "./prompt.js";
+import { runWedgeCognitionLoop } from "./cognition.js";
 import { openWedgeDatabase } from "./storage.js";
-import { triageWedgeMessage } from "./triage.js";
 
 type WedgeDiscordMessage = {
   id?: string;
@@ -12,6 +11,13 @@ type WedgeDiscordMessage = {
   guild_id?: string;
   author?: { id?: string; username?: string; global_name?: string | null; bot?: boolean } | null;
   attachments?: Array<unknown>;
+  referenced_message?: {
+    id?: string;
+    author?: { id?: string } | null;
+  } | null;
+  message_reference?: {
+    message_id?: string;
+  } | null;
 };
 
 type WedgeDiscordEvent = {
@@ -28,7 +34,7 @@ export type WedgeDiscordPrefilterResult =
 
 export async function runWedgeDiscordPrefilter(params: {
   data: WedgeDiscordEvent;
-  sendReply?: (channelId: string, text: string) => Promise<void>;
+  runtime?: WedgeActionRuntime;
   repoRoot?: string;
 }): Promise<WedgeDiscordPrefilterResult> {
   const message = params.data.message;
@@ -37,9 +43,6 @@ export async function runWedgeDiscordPrefilter(params: {
   const text = message?.content ?? "";
   if (!message?.id || !channelId) {
     return { action: "continue" };
-  }
-  if (author?.bot) {
-    return { action: "drop", reason: "wedge_bot_message" };
   }
 
   const ignored = readIgnoredChannelIds(params.repoRoot);
@@ -56,24 +59,40 @@ export async function runWedgeDiscordPrefilter(params: {
     db = openWedgeDatabase();
   } catch (err) {
     console.warn("[wedge] sqlite unavailable in discord prefilter:", err);
-    const adminCommand = parseWedgeAdminCommand(text);
-    if (adminCommand && params.sendReply) {
-      await params.sendReply(channelId, "ワシ、記憶DB、開けない");
-      return { action: "handled", reason: "wedge_admin_db_unavailable" };
-    }
     return { action: "continue" };
   }
 
   try {
+    const guildId = message.guild_id ?? params.data.guild_id;
     if (author?.id) {
       db.upsertUser({
         id: author.id,
         name: author.global_name ?? author.username,
         isBot: author.bot,
+        guildId,
         callSign: author.bot ? author.username : "ニンゲン",
       });
     }
-    db.upsertChannel({ id: channelId, guildId: message.guild_id ?? params.data.guild_id });
+    db.upsertChannel({ id: channelId, guildId });
+
+    db.insertLog({
+      messageId: message.id,
+      channelId,
+      userId: author?.id,
+      userName: author?.global_name ?? author?.username ?? undefined,
+      userIsBot: author?.bot ?? false,
+      guildId,
+      replyToMessageId: message.referenced_message?.id ?? message.message_reference?.message_id,
+      replyToUserId: message.referenced_message?.author?.id ?? undefined,
+      attachmentsJson: JSON.stringify(message.attachments ?? []),
+      content: text,
+      kind: "message",
+      metadataJson: JSON.stringify({ source: "discord" }),
+    });
+
+    if (author?.bot) {
+      return { action: "drop", reason: "wedge_bot_message_recorded" };
+    }
 
     const adminCommand = parseWedgeAdminCommand(text);
     if (adminCommand) {
@@ -82,84 +101,17 @@ export async function runWedgeDiscordPrefilter(params: {
         return { action: "drop", reason: "wedge_admin_denied" };
       }
       const reply = executeWedgeAdminCommand({ db, command: adminCommand, channelId });
-      if (reply && params.sendReply) {
-        await params.sendReply(channelId, reply);
+      if (reply && params.runtime?.sendDiscordMessage) {
+        await params.runtime.sendDiscordMessage({ channelId, content: reply, replyToMessageId: message.id });
       }
-      db.insertLog({
-        messageId: message.id,
-        channelId,
-        userId: author?.id,
-        guildId: message.guild_id ?? params.data.guild_id,
-        content: text,
-        kind: "admin",
-      });
       return { action: "handled", reason: "wedge_admin" };
     }
 
     const now = Math.floor(Date.now() / 1000);
     const state = db.getConversationState(channelId);
     if (state.sleepUntil && state.sleepUntil > now) {
-      return { action: "drop", reason: "wedge_sleeping" };
+      return { action: "drop", reason: "wedge_sleeping_recorded" };
     }
-
-    db.insertLog({
-      messageId: message.id,
-      channelId,
-      userId: author?.id,
-      guildId: message.guild_id ?? params.data.guild_id,
-      content: text,
-      kind: "message",
-      metadataJson: JSON.stringify({ attachmentCount: message.attachments?.length ?? 0 }),
-    });
-
-    const recentLogs = db.listRecentLogs(channelId, 24);
-    const triage = triageWedgeMessage({
-      text,
-      authorId: author?.id,
-      state,
-      recentLogs,
-      now,
-    });
-    if (triage.action === "block") {
-      if (params.sendReply) {
-        await params.sendReply(channelId, triage.reply);
-      }
-      db.insertLog({
-        messageId: `wedge-reply-${message.id}`,
-        channelId,
-        userId: undefined,
-        guildId: message.guild_id ?? params.data.guild_id,
-        content: triage.reply,
-        kind: "action",
-        metadataJson: JSON.stringify({ triage: triage.reason }),
-      });
-      return { action: "handled", reason: `wedge_${triage.reason}` };
-    }
-    if (triage.action === "bored") {
-      db.setConversationState(channelId, { boredUntil: triage.statePatch.boredUntil, thinking: false });
-      if (params.sendReply) {
-        await params.sendReply(channelId, triage.reply);
-      }
-      db.insertLog({
-        messageId: `wedge-reply-${message.id}`,
-        channelId,
-        userId: undefined,
-        guildId: message.guild_id ?? params.data.guild_id,
-        content: triage.reply,
-        kind: "action",
-        metadataJson: JSON.stringify({ triage: triage.reason }),
-      });
-      return { action: "handled", reason: `wedge_${triage.reason}` };
-    }
-
-    if (triage.flags.offeringSeen) {
-      db.upsertNestItem({
-        name: `供物:${message.id}`,
-        description: text.slice(0, 500),
-        quantity: 1,
-      });
-    }
-
     if (state.thinking) {
       db.appendInterrupt(
         channelId,
@@ -168,54 +120,36 @@ export async function runWedgeDiscordPrefilter(params: {
       return { action: "drop", reason: "wedge_interrupt_appended" };
     }
 
-    if (!params.sendReply) {
-      return { action: "continue" };
-    }
-
-    db.setConversationState(channelId, { ...triage.statePatch, thinking: true });
+    db.setConversationState(channelId, { thinking: true });
     try {
-      console.log(
-        `[wedge] ollama direct start message=${message.id} requestLike=${triage.flags.requestLike} offeringSeen=${triage.flags.offeringSeen} sameTopic=${triage.flags.sameTopic}`,
-      );
-      const promptLogs = db.listRecentLogs(channelId, 24);
-      const reply = await generateWedgeOllamaReply({
-        systemPrompt: buildWedgeSystemPrompt({
-          db,
+      await runWedgeCognitionLoop({
+        db,
+        trigger: {
+          kind: "discord_message",
+          messageId: message.id,
           channelId,
-          imageCount: message.attachments?.length ?? 0,
-          recentLogs: promptLogs,
-          conversationControl: triage.flags,
-        }),
-        userText: text,
-      });
-      console.log(`[wedge] ollama direct done message=${message.id} replyLength=${reply.length}`);
-      await params.sendReply(channelId, reply);
-      db.insertLog({
-        messageId: `wedge-reply-${message.id}`,
-        channelId,
-        userId: undefined,
-        guildId: message.guild_id ?? params.data.guild_id,
-        content: reply,
-        kind: "action",
-        metadataJson: JSON.stringify({ source: "ollama_direct" }),
+          guildId: guildId ?? null,
+          userId: author?.id,
+          userName: author?.global_name ?? author?.username ?? null,
+          userIsBot: author?.bot ?? false,
+          text,
+          replyToMessageId: message.referenced_message?.id ?? message.message_reference?.message_id ?? null,
+          replyToUserId: message.referenced_message?.author?.id ?? null,
+          attachments: message.attachments ?? [],
+        },
+        runtime: params.runtime,
       });
     } catch (err) {
-      console.warn("[wedge] ollama direct failed:", err);
-      const fallback = "ワシ、今、頭つまった";
-      await params.sendReply(channelId, fallback);
-      db.insertLog({
-        messageId: `wedge-error-${message.id}`,
+      console.warn("[wedge] cognition loop failed:", err);
+      await params.runtime?.sendDiscordMessage?.({
         channelId,
-        userId: undefined,
-        guildId: message.guild_id ?? params.data.guild_id,
-        content: fallback,
-        kind: "action",
-        metadataJson: JSON.stringify({ source: "ollama_error" }),
+        replyToMessageId: message.id,
+        content: "ワシ、今、頭つまった",
       });
     } finally {
       db.setConversationState(channelId, { thinking: false });
     }
-    return { action: "handled", reason: "wedge_ollama_direct" };
+    return { action: "handled", reason: "wedge_cognition" };
   } finally {
     db.close();
   }

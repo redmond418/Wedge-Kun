@@ -35,7 +35,6 @@ import { danger, logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtim
 import { resolveDiscordMaxLinesPerMessage } from "../accounts.js";
 import { createDiscordRestClient } from "../client.js";
 import { removeReactionDiscord } from "../send.js";
-import { sendMessageDiscord } from "../send.js";
 import { editMessageDiscord } from "../send.messages.js";
 import { resolveDiscordTargetChannelId } from "../send.shared.js";
 import { resolveDiscordChannelId } from "../targets.js";
@@ -54,7 +53,6 @@ import {
   DISCORD_ATTACHMENT_TOTAL_TIMEOUT_MS,
 } from "./timeouts.js";
 import { sendTyping } from "./typing.js";
-import { triageWedgeMessage } from "../../../../src/wedge/triage.js";
 import { openWedgeDatabase } from "../../../../src/wedge/storage.js";
 
 function sleep(ms: number): Promise<void> {
@@ -175,32 +173,6 @@ export async function processDiscordMessage(
     logVerbose("discord: drop message " + message.id + " (empty content)");
     return;
   }
-  try {
-    const wedgeDb = openWedgeDatabase();
-    try {
-      const state = wedgeDb.getConversationState(messageChannelId);
-      const triage = triageWedgeMessage({
-        text,
-        state,
-        recentLogs: wedgeDb.listRecentLogs(messageChannelId, 24),
-        now: Math.floor(Date.now() / 1000),
-      });
-      if (triage.action === "block" || triage.action === "bored") {
-        await sendMessageDiscord(`channel:${messageChannelId}`, triage.reply, {
-          cfg,
-          token,
-          accountId,
-        });
-        return;
-      }
-      wedgeDb.setConversationState(messageChannelId, { ...triage.statePatch, thinking: true });
-    } finally {
-      wedgeDb.close();
-    }
-  } catch (err) {
-    logVerbose("discord: wedge sqlite unavailable during triage: " + String(err));
-  }
-
   const boundThreadId = ctx.threadBinding?.conversation?.conversationId?.trim();
   if (boundThreadId && typeof threadBindings.touchThread === "function") {
     threadBindings.touchThread({ threadId: boundThreadId });
