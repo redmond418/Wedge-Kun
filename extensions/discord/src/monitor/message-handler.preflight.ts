@@ -81,6 +81,11 @@ function resolveDiscordPreflightConversationKind(params: {
   return { isDirectMessage, isGroupDm };
 }
 
+function logWedgePreflightDrop(reason: string, details?: Record<string, unknown>) {
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  console.log(`[wedge] preflight drop: ${reason}${suffix}`);
+}
+
 export async function preflightDiscordMessage(
   params: DiscordMessagePreflightParams,
 ): Promise<DiscordMessagePreflightContext | null> {
@@ -91,6 +96,7 @@ export async function preflightDiscordMessage(
   let message = params.data.message;
   const author = params.data.author;
   if (!author) {
+    logWedgePreflightDrop("missing_author");
     return null;
   }
   const messageChannelId = resolveDiscordMessageChannelId({
@@ -99,6 +105,7 @@ export async function preflightDiscordMessage(
   });
   if (!messageChannelId) {
     logVerbose(`discord: drop message ${message.id} (missing channel id)`);
+    logWedgePreflightDrop("missing_channel_id");
     return null;
   }
 
@@ -107,6 +114,7 @@ export async function preflightDiscordMessage(
     allowBotsSetting === "mentions" ? "mentions" : allowBotsSetting === true ? "all" : "off";
   if (params.botUserId && author.id === params.botUserId) {
     // Always ignore own messages to prevent self-reply loops
+    logWedgePreflightDrop("own_message");
     return null;
   }
 
@@ -184,6 +192,7 @@ export async function preflightDiscordMessage(
   if (author.bot) {
     if (allowBotsMode === "off" && !sender.isPluralKit) {
       logVerbose("discord: drop bot message (allowBots=false)");
+      logWedgePreflightDrop("bot_not_allowed");
       return null;
     }
   }
@@ -194,10 +203,12 @@ export async function preflightDiscordMessage(
 
   if (isGroupDm && !params.groupDmEnabled) {
     logVerbose("discord: drop group dm (group dms disabled)");
+    logWedgePreflightDrop("group_dm_disabled");
     return null;
   }
   if (isDirectMessage && !params.dmEnabled) {
     logVerbose("discord: drop dm (dms disabled)");
+    logWedgePreflightDrop("dm_disabled");
     return null;
   }
 
@@ -220,6 +231,7 @@ export async function preflightDiscordMessage(
       return null;
     }
     if (!access) {
+      logWedgePreflightDrop("dm_access_denied");
       return null;
     }
     commandAuthorized = access.commandAuthorized;
@@ -253,6 +265,7 @@ export async function preflightDiscordMessage(
     abortSignal: params.abortSignal,
   });
   if (!threadContext) {
+    logWedgePreflightDrop("thread_context_missing");
     return null;
   }
   const { earlyThreadChannel, earlyThreadParentId, earlyThreadParentName, earlyThreadParentType } =
@@ -323,6 +336,7 @@ export async function preflightDiscordMessage(
       message.type === MessageType.ContextMenuCommand)
   ) {
     logVerbose("discord: drop channel command message");
+    logWedgePreflightDrop("channel_command_message");
     return null;
   }
 
@@ -348,6 +362,10 @@ export async function preflightDiscordMessage(
     logVerbose(
       `Blocked discord guild ${params.data.guild_id ?? "unknown"} (not in discord.guilds)`,
     );
+    logWedgePreflightDrop("guild_not_configured", {
+      guildId: params.data.guild_id,
+      configuredGuilds: Object.keys(params.guildEntries ?? {}),
+    });
     return null;
   }
 
@@ -393,6 +411,12 @@ export async function preflightDiscordMessage(
     channelMatchMeta,
   });
   if (!channelAccess.allowed) {
+    logWedgePreflightDrop("channel_access_denied", {
+      channelId: messageChannelId,
+      groupPolicy: params.groupPolicy,
+      channelAllowlistConfigured: channelAccess.channelAllowlistConfigured,
+      channelAllowed: channelAccess.channelAllowed,
+    });
     return null;
   }
   const { channelAllowlistConfigured, channelAllowed } = channelAccess;
@@ -415,7 +439,8 @@ export async function preflightDiscordMessage(
     channelConfig,
     guildInfo,
   });
-  const shouldRequireMention = resolvePreflightMentionRequirement({
+  const shouldRequireMention = false;
+  const shouldRequireMentionFromConfig = resolvePreflightMentionRequirement({
     shouldRequireMention: shouldRequireMentionByConfig,
     bypassMentionRequirement,
   });
@@ -431,6 +456,7 @@ export async function preflightDiscordMessage(
     logDebug(`[discord-preflight] drop: member not allowed`);
     // Keep stable Discord user IDs out of routine deny-path logs.
     logVerbose("Blocked discord guild sender (not in users/roles allowlist)");
+    logWedgePreflightDrop("member_not_allowed");
     return null;
   }
 
@@ -530,12 +556,13 @@ export async function preflightDiscordMessage(
   });
   const effectiveWasMentioned = mentionDecision.effectiveWasMentioned;
   logDebug(
-    `[discord-preflight] shouldRequireMention=${shouldRequireMention} baseRequireMention=${shouldRequireMentionByConfig} boundThreadSession=${isBoundThreadSession} mentionDecision.shouldSkip=${mentionDecision.shouldSkip} wasMentioned=${wasMentioned}`,
+    `[discord-preflight] shouldRequireMention=${shouldRequireMention} configRequireMention=${shouldRequireMentionFromConfig} baseRequireMention=${shouldRequireMentionByConfig} boundThreadSession=${isBoundThreadSession} mentionDecision.shouldSkip=${mentionDecision.shouldSkip} wasMentioned=${wasMentioned}`,
   );
   if (isGuildMessage && shouldRequireMention) {
     if (mentionDecision.shouldSkip) {
       logDebug(`[discord-preflight] drop: no-mention`);
       logVerbose(`discord: drop guild message (mention required, botId=${botId ?? "<missing>"})`);
+      logWedgePreflightDrop("mention_required");
       logger.info(
         {
           channelId: messageChannelId,
@@ -558,6 +585,7 @@ export async function preflightDiscordMessage(
     if (!botMentioned) {
       logDebug(`[discord-preflight] drop: bot message missing mention (allowBots=mentions)`);
       logVerbose("discord: drop bot message (allowBots=mentions, missing mention)");
+      logWedgePreflightDrop("bot_missing_mention");
       return null;
     }
   }
@@ -575,6 +603,7 @@ export async function preflightDiscordMessage(
     logVerbose(
       `discord: drop guild message (another user/role mentioned, ignoreOtherMentions=true, botId=${botId})`,
     );
+    logWedgePreflightDrop("other_mention_ignored");
     recordPendingHistoryEntryIfEnabled({
       historyMap: params.guildHistories,
       historyKey: messageChannelId,
@@ -594,6 +623,7 @@ export async function preflightDiscordMessage(
   const systemText = resolveDiscordSystemEvent(message, systemLocation);
   if (systemText) {
     logDebug(`[discord-preflight] drop: system event`);
+    logWedgePreflightDrop("system_event");
     enqueueSystemEvent(systemText, {
       sessionKey: effectiveRoute.sessionKey,
       contextKey: `discord:system:${messageChannelId}:${message.id}`,
@@ -604,6 +634,7 @@ export async function preflightDiscordMessage(
   if (!messageText) {
     logDebug(`[discord-preflight] drop: empty content`);
     logVerbose(`discord: drop message ${message.id} (empty content)`);
+    logWedgePreflightDrop("empty_content");
     return null;
   }
   if (configuredBinding) {
@@ -615,6 +646,7 @@ export async function preflightDiscordMessage(
       logVerbose(
         `discord: configured ACP binding unavailable for channel ${configuredBinding.record.conversation.conversationId}: ${ensured.error}`,
       );
+      logWedgePreflightDrop("configured_binding_unavailable", { error: ensured.error });
       return null;
     }
   }

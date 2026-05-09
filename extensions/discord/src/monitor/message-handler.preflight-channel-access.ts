@@ -42,6 +42,13 @@ export function resolveDiscordPreflightChannelAccess(params: {
   const channelAllowlistConfigured =
     Boolean(params.guildInfo?.channels) && Object.keys(params.guildInfo?.channels ?? {}).length > 0;
   const channelAllowed = params.channelConfig?.allowed !== false;
+  if (params.isGuildMessage && params.groupPolicy === "allowlist" && !channelAllowlistConfigured) {
+    logDebug(`[discord-preflight] pass: Wedge allowlist policy without channel list`);
+    logVerbose(
+      `discord: allow channel ${params.messageChannelId} (Wedge uses config/ignored_channels.json for exclusions)`,
+    );
+    return { allowed: true, channelAllowlistConfigured, channelAllowed };
+  }
   if (
     params.isGuildMessage &&
     !isDiscordGroupAllowedByPolicy({

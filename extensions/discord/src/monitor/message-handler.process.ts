@@ -35,6 +35,7 @@ import { danger, logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtim
 import { resolveDiscordMaxLinesPerMessage } from "../accounts.js";
 import { createDiscordRestClient } from "../client.js";
 import { removeReactionDiscord } from "../send.js";
+import { sendMessageDiscord } from "../send.js";
 import { editMessageDiscord } from "../send.messages.js";
 import { resolveDiscordTargetChannelId } from "../send.shared.js";
 import { resolveDiscordChannelId } from "../targets.js";
@@ -53,6 +54,8 @@ import {
   DISCORD_ATTACHMENT_TOTAL_TIMEOUT_MS,
 } from "./timeouts.js";
 import { sendTyping } from "./typing.js";
+import { triageWedgeMessage } from "../../../../src/wedge/triage.js";
+import { openWedgeDatabase } from "../../../../src/wedge/storage.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -144,6 +147,7 @@ export async function processDiscordMessage(
   if (isProcessAborted(abortSignal)) {
     return;
   }
+  console.log(`[wedge] process start message=${message.id} channel=${messageChannelId}`);
 
   const ssrfPolicy = cfg.browser?.ssrfPolicy;
   const mediaResolveOptions = {
@@ -170,6 +174,31 @@ export async function processDiscordMessage(
   if (!text) {
     logVerbose("discord: drop message " + message.id + " (empty content)");
     return;
+  }
+  try {
+    const wedgeDb = openWedgeDatabase();
+    try {
+      const state = wedgeDb.getConversationState(messageChannelId);
+      const triage = triageWedgeMessage({
+        text,
+        state,
+        recentLogs: wedgeDb.listRecentLogs(messageChannelId, 24),
+        now: Math.floor(Date.now() / 1000),
+      });
+      if (triage.action === "block" || triage.action === "bored") {
+        await sendMessageDiscord(`channel:${messageChannelId}`, triage.reply, {
+          cfg,
+          token,
+          accountId,
+        });
+        return;
+      }
+      wedgeDb.setConversationState(messageChannelId, { ...triage.statePatch, thinking: true });
+    } finally {
+      wedgeDb.close();
+    }
+  } catch (err) {
+    logVerbose("discord: wedge sqlite unavailable during triage: " + String(err));
   }
 
   const boundThreadId = ctx.threadBinding?.conversation?.conversationId?.trim();
@@ -343,11 +372,15 @@ export async function processDiscordMessage(
     reactionAdapter: discordAdapter,
     target: `${messageChannelId}/${message.id}`,
   });
+  console.log(`[wedge] build context start message=${message.id}`);
   const processContext = await buildDiscordMessageProcessContext({
     ctx,
     text,
     mediaList,
   });
+  console.log(
+    `[wedge] build context done message=${message.id} ok=${processContext ? "yes" : "no"}`,
+  );
   if (!processContext) {
     return;
   }
@@ -611,6 +644,7 @@ export async function processDiscordMessage(
       await settleDispatchBeforeStart();
       return;
     }
+    console.log(`[wedge] inbound turn start message=${message.id}`);
     const preparedResult = await runInboundReplyTurn({
       channel: "discord",
       accountId: route.accountId,
@@ -640,7 +674,8 @@ export async function processDiscordMessage(
           },
           onPreDispatchFailure: settleDispatchBeforeStart,
           runDispatch: async () => {
-            return await dispatchInboundMessage({
+            console.log(`[wedge] dispatch start message=${message.id}`);
+            const result = await dispatchInboundMessage({
               ctx: ctxPayload,
               cfg,
               dispatcher,
@@ -785,10 +820,17 @@ export async function processDiscordMessage(
                 },
               },
             });
+            console.log(
+              `[wedge] dispatch done message=${message.id} final=${result.counts.final} failedFinal=${result.failedCounts?.final ?? 0}`,
+            );
+            return result;
           },
         }),
       },
     });
+    console.log(
+      `[wedge] inbound turn done message=${message.id} dispatched=${preparedResult.dispatched}`,
+    );
     if (!preparedResult.dispatched) {
       return;
     }
@@ -805,6 +847,16 @@ export async function processDiscordMessage(
     dispatchError = true;
     throw err;
   } finally {
+    try {
+      const wedgeDbDone = openWedgeDatabase();
+      try {
+        wedgeDbDone.setConversationState(messageChannelId, { thinking: false });
+      } finally {
+        wedgeDbDone.close();
+      }
+    } catch (err) {
+      logVerbose("discord: wedge sqlite unavailable while clearing thinking state: " + String(err));
+    }
     try {
       await draftPreview.cleanup();
     } finally {

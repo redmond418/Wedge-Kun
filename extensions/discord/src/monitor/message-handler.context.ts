@@ -28,6 +28,8 @@ import {
 } from "./message-utils.js";
 import { buildDirectLabel, buildGuildLabel, resolveReplyContext } from "./reply-context.js";
 import { resolveDiscordAutoThreadReplyPlan, resolveDiscordThreadStarter } from "./threading.js";
+import { buildWedgeSystemPrompt } from "../../../../src/wedge/prompt.js";
+import { openWedgeDatabase } from "../../../../src/wedge/storage.js";
 
 function normalizeDiscordDmOwnerEntry(entry: string): string | undefined {
   const normalized = normalizeDiscordAllowList([entry], ["discord:", "user:", "pk:"]);
@@ -306,6 +308,22 @@ export async function buildDiscordMessageProcessContext(params: {
           sessionKey: effectiveSessionKey,
         });
 
+  let wedgeSystemPrompt = "";
+  try {
+    const wedgeDb = openWedgeDatabase();
+    try {
+      wedgeSystemPrompt = buildWedgeSystemPrompt({
+        db: wedgeDb,
+        channelId: messageChannelId,
+        imageCount: mediaList.length,
+      });
+    } finally {
+      wedgeDb.close();
+    }
+  } catch (err) {
+    logVerbose("discord: wedge sqlite unavailable while building context: " + String(err));
+  }
+
   const ctxPayload = finalizeInboundContext({
     Body: combinedBody,
     BodyForAgent: preflightAudioTranscript ?? baseText ?? text,
@@ -327,7 +345,9 @@ export async function buildDiscordMessageProcessContext(params: {
     GroupChannel: groupChannel,
     MemberRoleIds: memberRoleIds,
     UntrustedContext: untrustedContext,
-    GroupSystemPrompt: isGuildMessage ? groupSystemPrompt : undefined,
+    GroupSystemPrompt: [wedgeSystemPrompt, isGuildMessage ? groupSystemPrompt : undefined]
+      .filter(Boolean)
+      .join("\n\n"),
     GroupSpace: isGuildMessage ? (guildInfo?.id ?? guildSlug) || undefined : undefined,
     OwnerAllowFrom: ownerAllowFrom,
     Provider: "discord" as const,

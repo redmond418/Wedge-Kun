@@ -6,6 +6,9 @@ import { danger, logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/runtime-group-policy";
 import { createDiscordRestClient } from "../client.js";
 import type { Client } from "../internal/discord.js";
+import { sendMessageDiscord } from "../send.js";
+import { startWedgeDailyMemoryBatch } from "../../../../src/wedge/cron.js";
+import { runWedgeDiscordPrefilter } from "../../../../src/wedge/discord-prefilter.js";
 import {
   buildDiscordInboundReplayKey,
   claimDiscordInboundReplay,
@@ -50,6 +53,7 @@ type DiscordMessageHandlerTestingHooks = DiscordMessageRunQueueTestingHooks & {
 let messagePreflightRuntimePromise:
   | Promise<typeof import("./message-handler.preflight.js")>
   | undefined;
+let wedgeMemoryBatchStarted = false;
 
 async function loadMessagePreflightRuntime() {
   messagePreflightRuntimePromise ??= import("./message-handler.preflight.js");
@@ -97,6 +101,14 @@ function queueAcceptedDiscordTypingCue(ctx: DiscordMessagePreflightContext): voi
 export function createDiscordMessageHandler(
   params: DiscordMessageHandlerParams,
 ): DiscordMessageHandlerWithLifecycle {
+  if (!wedgeMemoryBatchStarted) {
+    wedgeMemoryBatchStarted = true;
+    try {
+      startWedgeDailyMemoryBatch();
+    } catch (err) {
+      params.runtime.error?.(danger(`wedge memory batch startup failed: ${String(err)}`));
+    }
+  }
   const { groupPolicy } = resolveOpenProviderRuntimeGroupPolicy({
     providerConfigPresent: params.cfg.channels?.discord !== undefined,
     groupPolicy: params.discordConfig?.groupPolicy,
@@ -182,10 +194,12 @@ export function createDiscordMessageHandler(
             client: last.client,
           });
           if (!ctx) {
+            console.log("[wedge] preflight returned null");
             await commitDiscordInboundReplay({ replayKeys, replayGuard });
             return;
           }
           applyImplicitReplyBatchGate(ctx, params.replyToMode, false);
+          console.log(`[wedge] enqueue process message id=${ctx.message.id} channel=${ctx.messageChannelId}`);
           queueAcceptedDiscordTypingCue(ctx);
           messageRunQueue.enqueue(buildDiscordInboundJob(ctx, { replayKeys }));
           return;
@@ -232,10 +246,12 @@ export function createDiscordMessageHandler(
           client: last.client,
         });
         if (!ctx) {
+          console.log("[wedge] preflight returned null");
           await commitDiscordInboundReplay({ replayKeys, replayGuard });
           return;
         }
         applyImplicitReplyBatchGate(ctx, params.replyToMode, true);
+        console.log(`[wedge] enqueue process batch channel=${ctx.messageChannelId}`);
         if (entries.length > 1) {
           const ids = entries.map((entry) => entry.data.message?.id).filter(isNonEmptyString);
           if (ids.length > 0) {
@@ -268,6 +284,19 @@ export function createDiscordMessageHandler(
   const handler: DiscordMessageHandlerWithLifecycle = async (data, client, options) => {
     try {
       if (options?.abortSignal?.aborted) {
+        return;
+      }
+      const wedgePrefilter = await runWedgeDiscordPrefilter({
+        data,
+        sendReply: async (channelId, text) => {
+          await sendMessageDiscord(`channel:${channelId}`, text, {
+            cfg: params.cfg,
+            token: params.token,
+            accountId: params.accountId,
+          });
+        },
+      });
+      if (wedgePrefilter.action !== "continue") {
         return;
       }
       // Filter bot-own messages before they enter the debounce queue.
