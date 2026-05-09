@@ -1679,7 +1679,8 @@
     "ui:dev": "node scripts/ui.js dev",
     "ui:i18n:check": "node --import tsx scripts/control-ui-i18n.ts check",
     "ui:i18n:sync": "node --import tsx scripts/control-ui-i18n.ts sync --write",
-    "ui:install": "node scripts/ui.js install"
+    "ui:install": "node scripts/ui.js install",
+    "wedge": "tsx src/wedge/cli.ts"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "0.21.0",
@@ -1707,6 +1708,7 @@
     "@slack/types": "^2.21.0",
     "@slack/web-api": "^7.15.2",
     "ajv": "^8.20.0",
+    "better-sqlite3": "^12.5.0",
     "chalk": "^5.6.2",
     "chokidar": "^5.0.0",
     "commander": "^14.0.3",
@@ -1726,6 +1728,7 @@
     "markdown-it": "14.1.1",
     "minimatch": "10.2.5",
     "node-edge-tts": "^1.2.10",
+    "node-cron": "^4.2.1",
     "openai": "^6.36.0",
     "openshell": "0.1.0",
     "pdfjs-dist": "^5.7.284",
@@ -1752,7 +1755,9 @@
     "@lit/context": "^1.1.6",
     "@mdx-js/mdx": "^3.1.1",
     "@types/express": "^5.0.6",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/markdown-it": "^14.1.2",
+    "@types/node-cron": "^3.0.11",
     "@types/node": "25.6.0",
     "@types/ws": "^8.18.1",
     "@typescript/native-preview": "7.0.0-dev.20260504.1",

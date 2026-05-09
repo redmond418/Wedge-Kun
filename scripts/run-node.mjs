@@ -568,7 +568,70 @@ const getInterruptedSpawnExitCode = (res) => {
   return null;
 };
 
+const resolveNpmCommandForExecPath = (execPath) => {
+  const nodeDir = path.dirname(execPath);
+  if (process.platform === "win32") {
+    const npmCmd = path.join(nodeDir, "npm.cmd");
+    return fs.existsSync(npmCmd) ? npmCmd : null;
+  }
+  const npmCli = path.join(nodeDir, "npm");
+  return fs.existsSync(npmCli) ? npmCli : "npm";
+};
+
+const ensureBetterSqliteRuntimeBinding = (deps) => {
+  const packageDir = path.join(deps.cwd, "node_modules", "better-sqlite3");
+  if (!deps.fs.existsSync(packageDir)) {
+    return true;
+  }
+  const probe = deps.spawnSync(
+    deps.execPath,
+    ["-e", "const Database = require(process.argv[1]); const db = new Database(':memory:'); db.close();", packageDir],
+    {
+      cwd: deps.cwd,
+      env: deps.env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (probe.status === 0) {
+    return true;
+  }
+  const npmCommand = resolveNpmCommandForExecPath(deps.execPath);
+  if (!npmCommand) {
+    logRunner("better-sqlite3 runtime binding is stale, but npm was not found.", deps);
+    return true;
+  }
+  logRunner("Rebuilding better-sqlite3 for the active Node runtime.", deps);
+  const rebuild = deps.spawnSync(npmCommand, ["rebuild"], {
+    cwd: packageDir,
+    env: deps.env,
+    encoding: "utf8",
+    stdio: "inherit",
+  });
+  if (rebuild.status !== 0) {
+    logRunner("better-sqlite3 rebuild failed; continuing with runtime fallback.", deps);
+    return true;
+  }
+  const reprobe = deps.spawnSync(
+    deps.execPath,
+    ["-e", "const Database = require(process.argv[1]); const db = new Database(':memory:'); db.close();", packageDir],
+    {
+      cwd: deps.cwd,
+      env: deps.env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (reprobe.status !== 0) {
+    logRunner("better-sqlite3 remains unavailable; continuing with runtime fallback.", deps);
+  }
+  return true;
+};
+
 const runOpenClaw = async (deps) => {
+  if (!ensureBetterSqliteRuntimeBinding(deps)) {
+    return 1;
+  }
   const diagnosticArgs = resolveRunNodeDiagnosticArgs(deps);
   const nodeProcess = deps.spawn(deps.execPath, [...diagnosticArgs, "openclaw.mjs", ...deps.args], {
     cwd: deps.cwd,
