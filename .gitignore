@@ -1,6 +1,13 @@
 node_modules
 **/node_modules/
 .env
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+config/admin_users.json
+config/ignored_channels.json
+config/soliloquy_channels.json
 docker-compose.override.yml
 docker-compose.extra.yml
 docker-compose.sandbox.yml
