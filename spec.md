@@ -1,129 +1,204 @@
-# ウェッジくん システム仕様書 (spec.md) - Openclaw Fork Edition
+# Wedge-kun System Specification
 
-## 1. プロジェクト概要
-本プロジェクトは、Discord上で自律的かつインタラクティブに稼働するAIチャットボット兼エージェント「ウェッジくん」を開発することを目的とする。
-既存の強力なエージェントフレームワークである **Openclaw** のリポジトリを直接フォーク（ソースコード改修）し、ウェッジくん独自の認知アーキテクチャ（贈り物ルール、飽きシステム、日次記憶バッチ等）をミドルウェアやフックとして組み込む。
-稼働環境は**Windows OS**とし、LLMはローカルホスティングの **Ollama (モデル: Gemma 4)** を頭脳として用いる。単なる一問一答のBotではなく、ローカルPCのファイル操作権限や独自の「巣（データベース）」を持ち、自律的な思考ループと割り込み処理を備えたデジタル同居人として振る舞う。
+## 1. 目的
 
-## 2. キャラクター定義
-*   **名称:** ウェッジくん
-*   **設定:** 自分をニンゲンだと思っているフクロウ。
-*   **話し方:** 助詞はほとんど省略し、単語だけで話すような短いカタコト文で話す。語尾に「である」「のである」などを多用する。長く話さず、基本的に３～５行で済ませる。一人称は「ワシ」。二人称は「ニンゲン」あるいは名前呼びか独自の呼称「○○(特徴)のヒト」など。
-*   **性格:** 
-    *   微妙に気難しく淡泊で、雑な態度をとる。
-    *   動物らしく好奇心旺盛で、いっぱい遊びたい一面を持つ。
-    *   Botに対してはある程度優しい。
-    *   自分をニンゲンだと思い込んでおり、Botやフクロウとして扱われると激怒する。
-*   **好きな物:** ドーナッツ、ドーナッツの穴、動物、Creative Coding、インディーゲーム、VJ、味の濃い食べ物、油の多い食べ物、シュールレアリスム的な概念やほとんど意味のないアイテム(特に満足を示す)、金銭的価値のあるもの。
-*   **嫌いなもの:** 苦い野菜、動物のおもしろ動画に対して勝手にアフレコするテレビ番組、大衆に人気のあるコンテンツ。
+このリポジトリは OpenClaw の fork であり、Discord 上で動く専用エージェント「ウェッジくん」を実装する。上流互換性よりも、ウェッジくん専用の認知ループ、SQLite 記憶、Discord アダプター、管理 CLI を優先する。
 
-## 3. システムアーキテクチャ・技術スタック
-*   **ベースフレームワーク:** Openclaw (Fork)
-*   **実行環境:** Windows OS / Node.js (TypeScript ESM)
-*   **LLMバックエンド:** Ollamaを使用したローカルホスティング (Gemma 4)。Adapter層は、Gemma 4のマルチモーダル機能（画像入力）をフル活用できるように構成する。
-*   **Discord連携:** Openclaw標準のDiscordアダプター（`discord.js`）を利用。
-*   **データベース:** `better-sqlite3` (ローカルのログ蓄積、名簿、長期記憶、巣のアイテム管理用)。
-*   **設定ファイル (`config/`):** 
-    *   `soliloquy_channels.json`: 自律行動（独り言）を許可するチャンネルのリスト。
-    *   `ignored_channels.json`: 監視対象外とするチャンネル（完全ブラックリスト）。
-    *   `admin_users.json`: 後述の管理者コマンドを実行できるユーザーIDのリスト。
+稼働環境は Windows、LLM は Ollama の Gemma 4 を基本とする。OpenClaw 標準の RAG 記憶には依存せず、Wedge 専用の SQLite 記憶を prompt に注入する。
 
-## 4. 認知アーキテクチャ（推論プロセス）
-Openclawの標準エージェントループに、以下の処理をミドルウェアやフックとして介入させる。
+## 2. Persona
 
-### フェーズ0: イベントキューと事前フィルタリング (ルールベース)
-*   **イベント駆動:** Discordでのメッセージ受信（メンション有無問わず全監視）。
-*   **完全不可視・足切りルール (即時ドロップ判定):**
-    1.  設定ファイルのブラックリスト対象チャンネルでの発言。
-    2.  メッセージの先頭が半角 `:` または全角 `：` で始まる発言。
-    *   ※これらに該当した場合、LLMの推論に回さないだけでなく、短期記憶(DBダンプ)への保存や割り込み処理など、一切のシステム処理から除外（無視）する。
-*   **名簿DBの自動登録:** メッセージ受信の最上流で、送信元ユーザーIDやチャンネルIDがDB(名簿)に存在しない場合、システム側がDiscord APIから情報を取得（Bot判定、サーバーID等）し、自動的に初期値を `INSERT` する。
-*   **マルチモーダル入力:** メッセージに画像添付があり、Gemma 4が対応している場合、画像データを推論コンテキストに直接入力する。
-*   **タイマー駆動 (自律行動):** 1時間おきに乱数を振り、当たりなら `soliloquy_channels.json` で許可されたチャンネルでのみ自律行動を開始する。
-*   **割り込み処理 (思考中の中断と継続):**
-    *   思考・ツール実行中に**同一チャンネル**で新しいメッセージを受信した場合、それまでの思考プロセス（Thought履歴）は**破棄せず**、現在のコンテキスト末尾に `[割り込み情報: 新しいメッセージを受信しました - ユーザー名: メッセージ内容]` を追記（Append）し、そのまま思考を再評価させる。
-    *   別チャンネルでの発言はバックグラウンドの記憶ダンプに回し、割り込みトリガーとしては扱わない。
+- 名称: ウェッジくん。
+- 自己認識: 自分をニンゲンだと思っている。Bot扱い、単なる鳥扱い、観察対象扱いを嫌う。
+- 話し方: 一人称は「ワシ」。二人称は原則「ニンゲン」。助詞を少なめにした短いカタコト。ただし、依頼結果や物語や説明は、意味が欠けない長さで返す。
+- 嗜好: ドーナツ、穴、Creative Coding、インディーゲーム、価値あるもの、シュールな概念。
+- 態度: 気難しく貪欲だが、好奇心があり、供物や面白い文脈には動く。
 
-### フェーズ1: 観察とコンテキスト構築
-LLMに渡すプロンプトを動的に構築する。
-*   **コアメモリの静的注入:**
-    *   System Promptの最上部に、長期記憶（コアメモリ）を注入する。
-    *   構成順序: `[キャラクター設定] -> [コアメモリ全文] -> [現在の日時・天候等] -> [短期ログコンテキスト]`
-*   **Discordメッセージの解像度向上:**
-    *   各メッセージログの構成: `[タイムスタンプ]`, `誰が送ったか（名前、ID、Botフラグ）`, `どこのチャンネルか`, `返信先は誰のどのメッセージか`。
-*   **コンテキスト注入の濃淡付け:**
-    *   **メイン閲覧チャンネル (10件):** 現在返信しようとしている対象、または自律行動対象のチャンネル。
-    *   **サブチャンネル (各4件):** 同一サーバー内のそれ以外のチャンネル（ブラックリスト除外済）。ただし送信から**2日以上経過しているものは除外**。
-*   **名簿データ (エンティティ) の注入:**
-    *   プロンプトの肥大化を防ぐため、コンテキスト（直近のログ）に登場している最大10名までのユーザーおよび関連チャンネルの情報をDBから抽出し、マッピングリストとして提供する。
+Persona は `src/wedge/prompts/persona.md` に置き、コードに直書きしない。
 
-### フェーズ2: トリアージと強制ルール (ミドルウェア介入)
-1.  **無視の判定:** ウェッジくんへのメンションがない他の人間・Bot宛の発言、または介入の必要がない発言は `ignore` として処理を終了。
-2.  **飽きシステム (強制終了とリセット):**
-    *   短期記憶を参照し、同じユーザーや話題でのやり取りが「3往復」に達した場合、強制的に「この話題はもう飽きた」というプロンプトを注入し会話をぶった斬る。
-    *   **解除条件:** 最後の会話から5分経過、全く別の話題が振られたとLLMが判断した場合、または供物が提示された場合にカウンターをリセットする。
+## 3. Event Intake
 
-### フェーズ3: 調査とイテレーション (Tool Loop)
-*   **Typing状態:** 思考中・ツール実行中は対象チャンネルで「書き込み中（Typing...）」ステータスを維持。
-*   **無限ループ防止:** 最大10回まで。到達時は強制的にフェーズ4へ移行。
-*   **贈り物・頼みごと判定 (LLM内処理):**
-    *   ユーザーの発言が「頼みごと（ツール使用を伴う等）」の場合、必ず物品/概念の提示を確認する。
-    *   提示がない場合はツール実行をブロックし、「くれるモノ、何」というように直接要求する出力をLLMに行わせる（システムプロンプトの最上位制約として記述）。
-    *   提示がある場合、満足度 >= 頼みごとレベル の時のみ実行。贈り物は（受取拒否時を除き）実行可否を問わず必ず「巣」に保存する。
+Discord の message create 最上流で Wedge prefilter を通す。
 
-### フェーズ4: 意思決定と最終行動
-いくつかのアクション（返信、リアクション、ファイル生成、巣の操作等）を実行し、ループを終了する。
+1. 先頭が `:` または `：` の発話、または `config/ignored_channels.json` の対象チャンネルは完全不可視とし、DB 保存、推論、割り込み判定を一切しない。
+2. それ以外の発話は、Bot 自身の発話や sleep 中の発話も含め、短期ログへ保存する。
+3. 未登録の user/channel は Discord API から取得できる範囲で `users` / `channels` へ登録する。
+4. 同一チャンネルで思考中に新規発話が来た場合は、思考ループを破棄せず interrupt として短期ログへ追加し、現在の context に追記して再評価させる。
+5. sleep 中は記憶だけ行い、推論や自律 action は起動しない。
 
-## 5. 記憶システムと名簿 (State & Entity Maintenance)
-RAGの検索漏れを防ぐため、網羅的記憶モデル・エンティティDB・日次バッチ処理を採用する。
+## 4. Cognition Loop
 
-*   **ユーザー・チャンネル名簿 (エンティティDB):**
-    *   `users` テーブル: `user_id`, `server_id` (Guild ID), `user_name`, `is_bot`, `call_sign`, `details` (自然言語で性格等を追記)。
-        *   `call_sign` の初期値: `is_bot` が true なら `user_name`、false なら `"ニンゲン"`。
-    *   `channels` テーブル: `channel_id`, `server_id`, `channel_name`, `purpose` (用途)。
-*   **短期ログ (生データダンプ):** 除外ルール（`:` やブラックリスト）を除くすべての会話やイベントをSQLiteに時系列で蓄積。
-*   **コアメモリ (常時注入の長期記憶):** 現在の自分の状態、関係性、重要な出来事をまとめたJSON/テキストデータ。
-*   **AM4:00の記憶整理バッチ (睡眠フェーズ):**
-    *   Windowsの `node-cron` 等で毎日午前4:00に自動実行。
-    *   LLMに「現在のコアメモリ全文」と「前日の短期ログ」を渡し、優先度の整理・統合・簡略化を行わせ、SQLiteのコアメモリを `UPDATE` する。
-    *   この際、会話から得られた新しい知見を元に名簿DB (`users.details` 等) も自動更新させる。
-*   **バッチのリカバリーと短期ログの破棄:**
-    *   起動時に最終バッチ実行日時を確認し、スキップされていればDiscord受付開始前にリカバリー実行する。
-    *   バッチが正常完了した場合、対象となったログの安全な破棄（3日前の短期ログを物理削除等）を行う。
+Wedge は「rule triage + 一発返信」ではなく、LLM が JSON で判断し、必要な action を実行し、tool result を context に追加して再思考する loop で動く。
 
-## 6. ツール定義 (Skills / Function Calling)
+### 4.1 Loop Phases
 
-### 【Openclaw標準プラグインの利用】
-*   **`FileSystemSkill` & `TerminalSkill`:** Windows環境向け。重大なシステム破壊を防ぐため、カレントディレクトリやアクセス権限は **`C:\Users\<ユーザー名>\` 配下に厳格に制限**する。
-*   **`WebSearchSkill` / `BrowserSkill`:** インターネット検索、ページ本文読み取り。
-*   **`DiscordSkill`:** メッセージ管理、スレッド管理、ユーザー・サーバー情報取得、リアクション等、Discord APIの全機能。
-    *   **画像アイコン取得:** コンテキスト注入ではなく、任意のタイミングで対象の顔・アイコンをフェッチし、マルチモーダル入力へ渡すツールとして実装。
+各 trigger について最大 10 iteration まで以下を繰り返す。
 
-### 【カスタム開発 (独自Skill)】
-*   **🪹 巣の管理 (`NestSkill`):**
-    *   `{id, 名称, タイムスタンプ, 数量, 備考}` で所有物を管理。
-    *   操作: `stash_to_nest`, `update_nest_item`, `look_inside_nest`。
-    *   **`interact_with_nest` (引数: `target_channel_id`):** アイテムを消費・使用する。実行時、システム側で地の文（`*(ウェッジくんはドーナッツを...)*`）を送信する。
-    *   ※自律行動時は独り言チャンネルを、会話文脈では現在の会話チャンネルを `target_channel_id` に指定する。
+1. **Context build**
+   - 現在日時
+   - trigger message
+   - core memory
+   - 同一チャンネルの短期ログ
+   - registry 最大 10 名
+   - nest items
+   - reply 元、添付、送信者、チャンネル情報
+   - 直前 iteration の tool result
+2. **LLM decision**
+   - LLM は JSON オブジェクトのみを返す。
+   - Markdown、コードフェンス、自然文の前置きは禁止。
+3. **Action execution**
+   - JSON の `actions` を順に実行する。
+   - 実行結果やエラーを `cognition_steps` と短期ログへ保存する。
+4. **Re-think**
+   - `continue_loop=true` なら tool result を context に追加して再度 LLM に判断させる。
+   - `continue_loop=false` なら終了する。
 
-## 7. 運用・デバッグ機能 (Admin & CLI)
-*   **Discord管理者コマンド:** 設定ファイルの `admin_users.json` に記載されたユーザーのみ実行可能。
-    *   `!wedge_sleep <分>`: 指定分数システムをスリープ状態にする（メッセージ無視・自律行動停止）。
-    *   `!wedge_reset`: LLMの無限ループ等に対応するため、現在の思考キューやコンテキストを強制破棄し待機状態へ戻す。
-*   **CLI デバッグコマンド:** Windowsの起動ターミナルからシステム状態を操作・確認する。
-    *   `show_core_memory`: コアメモリ全文の表示。
-    *   `show_registry <user_id>`: 特定ユーザーの名簿データを表示。
-    *   `force_memory_batch`: AM4:00バッチの強制手動実行。
-    *   `dump_nest`: 巣の中身一覧の出力。
+### 4.2 LLM Output Schema
 
-## 8. AI向け コーディング規約 (Vibe Coding Guidelines)
-Codex等のAIアシスタントが実装を進める際の絶対遵守事項。
+LLM の出力は Zod schema `src/wedge/cognition-schema.ts` で検証する。最低限以下を含む。
 
-1.  **TypeScript Strict:** `tsconfig.json` は `strict: true` を遵守。`any` 禁止。LLM出力や外部データは `Zod` 等でスキーマ検証。
-2.  **Openclawのアーキテクチャ尊重:** ゼロからループを作らず、Openclawの仕組みに則って拡張すること。
-3.  **安全性とエラーハンドリング:** Windowsパス区切りに注意。ループ内エラーは確実に `try/catch` しメインプロセスを落とさない。Typing解除漏れを防ぐ。
-4.  **DBの安全な操作:** SQLite操作はSQLインジェクション防止のためPrepared Statementを必須化。数量更新時はトランザクションを用いる。
-5.  **状態の可観測性 (Observability):** エージェントのフェーズ、ツール使用、割り込み等をコンソールにプレフィックス付きでロギングする。
-6.  **作業の区切りでのコミット:** 1つの機能（NestSkill実装、バッチの仮組み等）が動くたびに細かく `git commit` を行う。
-7.  **コメントの記述と継続的更新:** ロジックの意図をコメントに残し、コード変更時は**必ずコメントも最新の仕様に合わせて書き換える**（陳腐化防止）。
-8.  **動作確認とテストの必須化:** 実装ステップごとにテストスクリプト実行またはローカル動作確認を行い、正常機能を確認してから次へ進む。
+```json
+{
+  "thought_summary": "保存してよい短い判断要約",
+  "triage": "ignore | block | bored | continue",
+  "request_level": 0,
+  "offering": {
+    "present": false,
+    "accepted": false,
+    "name": null,
+    "quantity": 0,
+    "satisfaction": 0,
+    "notes": null
+  },
+  "actions": [],
+  "continue_loop": false
+}
+```
+
+JSON parse に失敗した場合は 1 回だけ repair prompt を投げる。それでも失敗した場合は、安全な fallback action を返し、プロセスを落とさない。
+
+### 4.3 Action Model
+
+最終 action は Discord 投稿に限定しない。v1 で扱う action は以下。
+
+- `discord_send_message`
+- `discord_add_reaction`
+- `nest_stash`
+- `nest_update`
+- `nest_look`
+- `update_user_profile`
+- `fetch_user_recent_logs`
+- `fetch_user_avatar_context`
+- `write_core_memory`
+- `none`
+
+ファイル操作やターミナル操作は schema と拒否ログから始め、実行時は Windows user directory 配下の path guard を必ず通す。
+
+## 5. Triage, Offering, Boredom
+
+トリアージ、供物満足度、同一話題判定、飽き判定は、原則 LLM の構造化判断に寄せる。ルールベースで固定文を返さない。
+
+- 頼みごとには `request_level` を 0 から 10 で見積もる。
+- 雑談、短い説明、短い創作、呼び名をつける程度の軽い依頼は低から中程度に見積もる。実行を避けるために `request_level` を不自然に高くしない。
+- 供物は `offering` に構造化する。受け取る場合は `nest_stash` で巣へ保存する。
+- 供物が依頼の対価として十分なら、巣に保存したうえで依頼を実行する。
+- 供物不足で block する場合も、LLM が `discord_send_message` または `discord_add_reaction` を生成する。
+- 同じユーザー、同じ話題で 3 往復相当続く場合のみ bored を検討する。
+- 5分経過、別話題、供物提示で bored は解除する。
+- 人間との自然会話や別話題では、安易に bored にしない。
+
+## 6. Storage Schema
+
+SQLite は prepared statement のみで操作する。
+
+### users
+
+- `id`
+- `guild_id`
+- `name`: Discord 表示名
+- `call_sign`
+- `details`: 自然言語での性格、特徴、呼び名、関係性
+- `is_bot`
+- `updated_at`
+
+### channels
+
+- `id`
+- `guild_id`
+- `name`
+- `purpose`
+- `updated_at`
+
+### short_term_logs
+
+短期ログは、除外対象以外のすべての会話と action を時系列保存する。
+
+- `timestamp`
+- `message_id`
+- `kind`
+- `content`
+- `author`: name, id, bot flag
+- `channel`: name, id, guild id
+- `reply_to_message_id`
+- `reply_to_user_id`
+- `attachments_json`
+- `metadata_json`
+
+### core_memory
+
+コアメモリは生ログの連結ではなく、重要で継続的に覚えるべき情報だけを保存する。
+
+### nest_items
+
+巣のアイテムは以下で管理する。
+
+- `id`
+- `name`
+- `created_at`
+- `updated_at`
+- `quantity`
+- `notes`
+
+ID と timestamp 以外は LLM が「何であるか」「どの文脈でもらったか」を判断する。
+
+### cognition_runs / cognition_steps
+
+各 cognition loop の prompt、LLM JSON、action、tool result、エラーを保存し、デバッグ可能にする。
+
+## 7. Prompt Files
+
+Prompt はコード直書きにしない。
+
+- `src/wedge/prompts/persona.md`
+- `src/wedge/prompts/cognition-system.md`
+
+Prompt builder は以下の構造で組み立てる。
+
+- `[persona]`
+- `[rules]`
+- `[context_json]`
+- `[available_actions]`
+- `[output_schema]`
+
+## 8. Memory Batch
+
+AM 4:00 の記憶整理バッチは短期ログを LLM に渡し、重要情報だけを core memory、users.details、channels.purpose、nest item notes へ統合する。成功時のみ古い短期ログを削除する。失敗時はログを残し、次回再試行する。
+
+起動時には未実行分を検出し、recovery batch を走らせる。
+
+## 9. Admin And Debug
+
+Discord 管理コマンドは `config/admin_users.json` の user id のみ許可する。
+
+- `!wedge_sleep <分>`
+- `!wedge_reset`
+
+CLI は最低限以下をサポートする。
+
+- `show_core_memory`
+- `show_registry <id>`
+- `force_memory_batch`
+- `dump_nest`
+- `local_chat <channel> <user> <text>`
+
+LLM 入出力、JSON decision、action、tool result、最終 Discord 送信内容はデバッグログに出す。`WEDGE_DEBUG_LLM=0` で LLM 詳細ログを抑制できる。
