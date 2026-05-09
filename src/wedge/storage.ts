@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { z } from "zod";
+import type { WedgeAction, WedgeDecision } from "./cognition-schema.js";
 import { getWedgeDatabasePath } from "./config.js";
 
 const require = createRequire(import.meta.url);
@@ -10,7 +11,7 @@ let reportedSqliteFallback = false;
 
 type SqliteParams = Record<string, unknown> | unknown[];
 type SqliteStatement = {
-  run(...params: [SqliteParams] | unknown[]): unknown;
+  run(...params: [SqliteParams] | unknown[]): { lastInsertRowid?: number | bigint } | unknown;
   get(...params: [SqliteParams] | unknown[]): unknown;
   all(...params: [SqliteParams] | unknown[]): unknown[];
 };
@@ -28,6 +29,7 @@ const DiscordEntitySchema = z.object({
   id: z.string().min(1),
   name: z.string().optional(),
   callSign: z.string().optional(),
+  details: z.string().optional(),
   isBot: z.boolean().optional(),
   guildId: z.string().optional(),
 });
@@ -35,31 +37,47 @@ const DiscordEntitySchema = z.object({
 const LogInputSchema = z.object({
   messageId: z.string().min(1),
   channelId: z.string().min(1),
+  channelName: z.string().optional(),
   userId: z.string().optional(),
+  userName: z.string().optional(),
+  userIsBot: z.boolean().optional(),
   guildId: z.string().optional(),
+  replyToMessageId: z.string().optional(),
+  replyToUserId: z.string().optional(),
+  attachmentsJson: z.string().optional(),
   content: z.string(),
-  kind: z.enum(["message", "action", "interrupt", "admin"]),
+  kind: z.enum(["message", "action", "interrupt", "admin", "system"]),
   metadataJson: z.string().optional(),
 });
 
-const NestItemSchema = z.object({
-  name: z.string().min(1),
-  description: z.string().optional(),
-  quantity: z.number().int().optional(),
-});
+const NestItemSchema = z
+  .object({
+    id: z.number().int().positive().optional(),
+    name: z.string().min(1).optional(),
+    notes: z.string().optional().nullable(),
+    quantity: z.number().int().optional(),
+  })
+  .refine((value) => value.id !== undefined || value.name !== undefined, {
+    message: "nest item requires id or name",
+  });
 
 export type WedgeLogInput = z.infer<typeof LogInputSchema>;
 export type WedgeShortTermLog = {
   id: number;
   messageId: string;
   channelId: string;
+  channelName: string | null;
   userId: string | null;
+  userName: string | null;
+  userIsBot: 0 | 1;
   guildId: string | null;
   kind: WedgeLogInput["kind"];
   content: string;
+  replyToMessageId: string | null;
+  replyToUserId: string | null;
+  attachmentsJson: string | null;
   metadataJson: string | null;
   createdAt: number;
-  userName: string | null;
   callSign: string | null;
 };
 export type WedgeConversationState = {
@@ -72,14 +90,34 @@ export type WedgeConversationState = {
   offeringSeenAt?: number;
   boredUntil?: number;
 };
+export type WedgeRegistryEntry = {
+  id: string;
+  guildId: string | null;
+  name: string | null;
+  callSign: string | null;
+  details: string | null;
+  isBot: 0 | 1;
+};
+export type WedgeNestItem = {
+  id: number;
+  name: string;
+  notes: string | null;
+  quantity: number;
+  createdAt: number;
+  updatedAt: number;
+};
 
 export type WedgeDatabase = {
   path: string;
   close: () => void;
   upsertUser(input: z.infer<typeof DiscordEntitySchema>): void;
-  upsertChannel(input: z.infer<typeof DiscordEntitySchema>): void;
+  updateUserProfile(input: { id: string; callSign?: string | null; details?: string | null }): void;
+  upsertChannel(input: z.infer<typeof DiscordEntitySchema> & { purpose?: string }): void;
   insertLog(input: WedgeLogInput): void;
   listRecentLogs(channelId: string, limit?: number): WedgeShortTermLog[];
+  listMemoryBatchLogs(limit?: number): WedgeShortTermLog[];
+  listUserRecentLogs(userId: string, limit?: number): WedgeShortTermLog[];
+  deleteShortTermLogsThrough(maxId: number): void;
   appendInterrupt(channelId: string, content: string): void;
   setConversationState(
     channelId: string,
@@ -97,15 +135,20 @@ export type WedgeDatabase = {
   resetConversation(channelId?: string): void;
   getCoreMemoryText(): string;
   setCoreMemoryText(body: string): void;
-  listRegistry(limit?: number): Array<{
-    id: string;
-    name: string | null;
-    callSign: string | null;
-    isBot: 0 | 1;
-  }>;
-  listNestItems(): Array<{ name: string; description: string | null; quantity: number }>;
-  upsertNestItem(input: z.infer<typeof NestItemSchema>): void;
+  listRegistry(limit?: number): WedgeRegistryEntry[];
+  listNestItems(): WedgeNestItem[];
+  upsertNestItem(input: z.infer<typeof NestItemSchema>): WedgeNestItem;
   runMemoryBatch(now?: number): { logCount: number };
+  createCognitionRun(input: { triggerMessageId?: string; channelId: string; userId?: string }): number;
+  insertCognitionStep(input: {
+    runId: number;
+    iteration: number;
+    prompt: string;
+    decision?: WedgeDecision;
+    action?: WedgeAction;
+    resultJson?: string;
+    error?: string;
+  }): void;
 };
 
 export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabase {
@@ -120,78 +163,107 @@ export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabas
     upsertUser(input: z.infer<typeof DiscordEntitySchema>) {
       const value = DiscordEntitySchema.parse(input);
       db.prepare(
-        `INSERT INTO users (id, name, call_sign, is_bot, updated_at)
-         VALUES (@id, @name, @callSign, @isBot, unixepoch())
+        `INSERT INTO users (id, guild_id, name, call_sign, details, is_bot, updated_at)
+         VALUES (@id, @guildId, @name, @callSign, @details, @isBot, unixepoch())
          ON CONFLICT(id) DO UPDATE SET
+           guild_id = COALESCE(excluded.guild_id, users.guild_id),
            name = excluded.name,
            call_sign = COALESCE(excluded.call_sign, users.call_sign),
+           details = COALESCE(excluded.details, users.details),
            is_bot = excluded.is_bot,
            updated_at = unixepoch()`,
       ).run({
         id: value.id,
+        guildId: value.guildId ?? null,
         name: value.name ?? null,
         callSign: value.callSign ?? (value.isBot ? value.name ?? "Bot" : "ニンゲン"),
+        details: value.details ?? null,
         isBot: value.isBot ? 1 : 0,
       });
     },
-    upsertChannel(input: z.infer<typeof DiscordEntitySchema>) {
+    updateUserProfile(input: { id: string; callSign?: string | null; details?: string | null }) {
+      db.prepare(
+        `UPDATE users
+         SET call_sign = COALESCE(@callSign, call_sign),
+             details = COALESCE(@details, details),
+             updated_at = unixepoch()
+         WHERE id = @id`,
+      ).run({ id: input.id, callSign: input.callSign ?? null, details: input.details ?? null });
+    },
+    upsertChannel(input: z.infer<typeof DiscordEntitySchema> & { purpose?: string }) {
       const value = DiscordEntitySchema.parse(input);
       db.prepare(
-        `INSERT INTO channels (id, guild_id, name, updated_at)
-         VALUES (@id, @guildId, @name, unixepoch())
+        `INSERT INTO channels (id, guild_id, name, purpose, updated_at)
+         VALUES (@id, @guildId, @name, @purpose, unixepoch())
          ON CONFLICT(id) DO UPDATE SET
-           guild_id = excluded.guild_id,
-           name = excluded.name,
+           guild_id = COALESCE(excluded.guild_id, channels.guild_id),
+           name = COALESCE(excluded.name, channels.name),
+           purpose = COALESCE(excluded.purpose, channels.purpose),
            updated_at = unixepoch()`,
-      ).run({ id: value.id, guildId: value.guildId ?? null, name: value.name ?? null });
+      ).run({
+        id: value.id,
+        guildId: value.guildId ?? null,
+        name: value.name ?? null,
+        purpose: input.purpose ?? null,
+      });
     },
     insertLog(input: WedgeLogInput) {
       const value = LogInputSchema.parse(input);
       db.prepare(
         `INSERT INTO short_term_logs
-          (message_id, channel_id, user_id, guild_id, kind, content, metadata_json, created_at)
+          (message_id, channel_id, channel_name, user_id, user_name, user_is_bot, guild_id,
+           kind, content, reply_to_message_id, reply_to_user_id, attachments_json, metadata_json, created_at)
          VALUES
-          (@messageId, @channelId, @userId, @guildId, @kind, @content, @metadataJson, unixepoch())`,
+          (@messageId, @channelId, @channelName, @userId, @userName, @userIsBot, @guildId,
+           @kind, @content, @replyToMessageId, @replyToUserId, @attachmentsJson, @metadataJson, unixepoch())`,
       ).run({
         messageId: value.messageId,
         channelId: value.channelId,
+        channelName: value.channelName ?? null,
         userId: value.userId ?? null,
+        userName: value.userName ?? null,
+        userIsBot: value.userIsBot ? 1 : 0,
         guildId: value.guildId ?? null,
         kind: value.kind,
         content: value.content,
+        replyToMessageId: value.replyToMessageId ?? null,
+        replyToUserId: value.replyToUserId ?? null,
+        attachmentsJson: value.attachmentsJson ?? null,
         metadataJson: value.metadataJson ?? null,
       });
     },
     listRecentLogs(channelId: string, limit = 20) {
-      return db
-        .prepare(
-          `SELECT l.id,
-                  l.message_id AS messageId,
-                  l.channel_id AS channelId,
-                  l.user_id AS userId,
-                  l.guild_id AS guildId,
-                  l.kind,
-                  l.content,
-                  l.metadata_json AS metadataJson,
-                  l.created_at AS createdAt,
-                  u.name AS userName,
-                  u.call_sign AS callSign
-           FROM short_term_logs l
-           LEFT JOIN users u ON u.id = l.user_id
-           WHERE l.channel_id = ?
-           ORDER BY l.created_at DESC, l.id DESC
-           LIMIT ?`,
-        )
-        .all(channelId, limit)
-        .reverse() as WedgeShortTermLog[];
+      return selectLogs(
+        db,
+        `WHERE l.channel_id = ? ORDER BY l.created_at DESC, l.id DESC LIMIT ?`,
+        [channelId, limit],
+      ).reverse();
+    },
+    listUserRecentLogs(userId: string, limit = 10) {
+      return selectLogs(
+        db,
+        `WHERE l.user_id = ? ORDER BY l.created_at DESC, l.id DESC LIMIT ?`,
+        [userId, limit],
+      ).reverse();
+    },
+    listMemoryBatchLogs(limit = 200) {
+      return selectLogs(
+        db,
+        `WHERE l.kind IN ('message', 'action', 'interrupt', 'system')
+         ORDER BY l.created_at ASC, l.id ASC LIMIT ?`,
+        [limit],
+      );
+    },
+    deleteShortTermLogsThrough(maxId: number) {
+      db.prepare("DELETE FROM short_term_logs WHERE id <= ?").run(maxId);
     },
     appendInterrupt(channelId: string, content: string) {
-      db.prepare(
-        `INSERT INTO short_term_logs
-          (message_id, channel_id, kind, content, created_at)
-         VALUES
-          (@messageId, @channelId, 'interrupt', @content, unixepoch())`,
-      ).run({ messageId: `interrupt-${Date.now()}`, channelId, content });
+      this.insertLog({
+        messageId: `interrupt-${Date.now()}`,
+        channelId,
+        kind: "interrupt",
+        content,
+      });
     },
     setConversationState(
       channelId: string,
@@ -291,59 +363,161 @@ export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabas
     listRegistry(limit = 10) {
       return db
         .prepare(
-          `SELECT id, name, call_sign AS callSign, is_bot AS isBot
+          `SELECT id, guild_id AS guildId, name, call_sign AS callSign, details, is_bot AS isBot
            FROM users ORDER BY updated_at DESC LIMIT ?`,
         )
-        .all(limit) as Array<{ id: string; name: string | null; callSign: string | null; isBot: 0 | 1 }>;
+        .all(limit) as WedgeRegistryEntry[];
     },
     listNestItems() {
       return db
-        .prepare("SELECT name, description, quantity FROM nest_items ORDER BY name")
-        .all() as Array<{ name: string; description: string | null; quantity: number }>;
+        .prepare(
+          `SELECT id, name, notes, quantity, created_at AS createdAt, updated_at AS updatedAt
+           FROM nest_items ORDER BY updated_at DESC, id DESC`,
+        )
+        .all() as WedgeNestItem[];
     },
     upsertNestItem(input: z.infer<typeof NestItemSchema>) {
       const value = NestItemSchema.parse(input);
-      db.prepare(
-        `INSERT INTO nest_items (name, description, quantity, updated_at)
-         VALUES (@name, @description, @quantity, unixepoch())
-         ON CONFLICT(name) DO UPDATE SET
-           description = COALESCE(excluded.description, nest_items.description),
-           quantity = nest_items.quantity + excluded.quantity,
-           updated_at = unixepoch()`,
-      ).run({
+      if (value.id) {
+        db.prepare(
+          `UPDATE nest_items
+           SET name = COALESCE(@name, name),
+               notes = COALESCE(@notes, notes),
+               quantity = MAX(0, quantity + @quantity),
+               updated_at = unixepoch()
+           WHERE id = @id`,
+        ).run({
+          id: value.id,
+          name: value.name ?? null,
+          notes: value.notes ?? null,
+          quantity: value.quantity ?? 0,
+        });
+        const row = db
+          .prepare(
+            `SELECT id, name, notes, quantity, created_at AS createdAt, updated_at AS updatedAt
+             FROM nest_items WHERE id = ?`,
+          )
+          .get(value.id) as WedgeNestItem | undefined;
+        if (row) {
+          return row;
+        }
+      }
+      if (!value.name) {
+        throw new Error("nest item not found");
+      }
+      const existing = db
+        .prepare(
+          `SELECT id, name, notes, quantity, created_at AS createdAt, updated_at AS updatedAt
+           FROM nest_items WHERE name = ?`,
+        )
+        .get(value.name) as WedgeNestItem | undefined;
+      if (existing) {
+        db.prepare(
+          `UPDATE nest_items
+           SET notes = COALESCE(@notes, notes),
+               quantity = MAX(0, quantity + @quantity),
+               updated_at = unixepoch()
+           WHERE id = @id`,
+        ).run({ id: existing.id, notes: value.notes ?? null, quantity: value.quantity ?? 1 });
+        return {
+          ...existing,
+          notes: value.notes ?? existing.notes,
+          quantity: Math.max(0, existing.quantity + (value.quantity ?? 1)),
+          updatedAt: Math.floor(Date.now() / 1000),
+        };
+      }
+      const result = db
+        .prepare(
+          `INSERT INTO nest_items (name, notes, quantity, created_at, updated_at)
+           VALUES (@name, @notes, @quantity, unixepoch(), unixepoch())`,
+        )
+        .run({ name: value.name, notes: value.notes ?? null, quantity: value.quantity ?? 1 });
+      const id = getLastInsertRowId(result);
+      return {
+        id,
         name: value.name,
-        description: value.description ?? null,
+        notes: value.notes ?? null,
         quantity: value.quantity ?? 1,
-      });
+        createdAt: Math.floor(Date.now() / 1000),
+        updatedAt: Math.floor(Date.now() / 1000),
+      };
     },
     runMemoryBatch(now = Math.floor(Date.now() / 1000)) {
-      const logs = db
-        .prepare(
-          `SELECT content FROM short_term_logs
-           WHERE kind IN ('message', 'action', 'interrupt')
-           ORDER BY created_at ASC LIMIT 200`,
-        )
-        .all() as Array<{ content: string }>;
-      const previous = this.getCoreMemoryText();
-      const summary = logs.map((row) => row.content).join("\n").slice(-8000);
-      const next = [previous, summary ? `\n[Daily consolidation]\n${summary}` : ""]
-        .join("")
-        .trim();
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        this.setCoreMemoryText(next);
-        db.prepare(
-          "INSERT INTO memory_batch_runs (ran_at, status, log_count) VALUES (?, 'ok', ?)",
-        ).run(now, logs.length);
-        db.prepare("DELETE FROM short_term_logs WHERE kind IN ('message', 'action', 'interrupt')").run();
-        db.exec("COMMIT");
-      } catch (err) {
-        db.exec("ROLLBACK");
-        throw err;
-      }
+      const logs = selectLogs(
+        db,
+        `WHERE l.kind IN ('message', 'action', 'interrupt', 'system')
+         ORDER BY l.created_at ASC, l.id ASC LIMIT 200`,
+        [],
+      );
+      db.prepare(
+        "INSERT INTO memory_batch_runs (ran_at, status, log_count) VALUES (?, 'completed', ?)",
+      ).run(now, logs.length);
       return { logCount: logs.length };
     },
+    createCognitionRun(input: { triggerMessageId?: string; channelId: string; userId?: string }) {
+      const result = db
+        .prepare(
+          `INSERT INTO cognition_runs (trigger_message_id, channel_id, user_id, started_at, status)
+           VALUES (@triggerMessageId, @channelId, @userId, unixepoch(), 'running')`,
+        )
+        .run({
+          triggerMessageId: input.triggerMessageId ?? null,
+          channelId: input.channelId,
+          userId: input.userId ?? null,
+        });
+      return getLastInsertRowId(result);
+    },
+    insertCognitionStep(input: {
+      runId: number;
+      iteration: number;
+      prompt: string;
+      decision?: WedgeDecision;
+      action?: WedgeAction;
+      resultJson?: string;
+      error?: string;
+    }) {
+      db.prepare(
+        `INSERT INTO cognition_steps
+          (run_id, iteration, prompt, decision_json, action_json, result_json, error, created_at)
+         VALUES
+          (@runId, @iteration, @prompt, @decisionJson, @actionJson, @resultJson, @error, unixepoch())`,
+      ).run({
+        runId: input.runId,
+        iteration: input.iteration,
+        prompt: input.prompt,
+        decisionJson: input.decision ? JSON.stringify(input.decision) : null,
+        actionJson: input.action ? JSON.stringify(input.action) : null,
+        resultJson: input.resultJson ?? null,
+        error: input.error ?? null,
+      });
+    },
   };
+}
+
+function selectLogs(db: SqliteConnection, whereSql: string, params: unknown[]): WedgeShortTermLog[] {
+  return db
+    .prepare(
+      `SELECT l.id,
+              l.message_id AS messageId,
+              l.channel_id AS channelId,
+              l.channel_name AS channelName,
+              l.user_id AS userId,
+              COALESCE(l.user_name, u.name) AS userName,
+              l.user_is_bot AS userIsBot,
+              l.guild_id AS guildId,
+              l.kind,
+              l.content,
+              l.reply_to_message_id AS replyToMessageId,
+              l.reply_to_user_id AS replyToUserId,
+              l.attachments_json AS attachmentsJson,
+              l.metadata_json AS metadataJson,
+              l.created_at AS createdAt,
+              u.call_sign AS callSign
+       FROM short_term_logs l
+       LEFT JOIN users u ON u.id = l.user_id
+       ${whereSql}`,
+    )
+    .all(...params) as WedgeShortTermLog[];
 }
 
 function openSqliteConnection(dbPath: string): SqliteConnection {
@@ -360,6 +534,14 @@ function openSqliteConnection(dbPath: string): SqliteConnection {
   }
 }
 
+function getLastInsertRowId(result: unknown): number {
+  if (result && typeof result === "object" && "lastInsertRowid" in result) {
+    const value = (result as { lastInsertRowid?: number | bigint }).lastInsertRowid;
+    return Number(value ?? 0);
+  }
+  return 0;
+}
+
 function applyPragma(db: SqliteConnection, sql: string) {
   if (db.pragma) {
     db.pragma(sql);
@@ -372,8 +554,10 @@ function initializeWedgeSchema(db: SqliteConnection) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
+      guild_id TEXT,
       name TEXT,
       call_sign TEXT,
+      details TEXT,
       is_bot INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
     );
@@ -381,16 +565,23 @@ function initializeWedgeSchema(db: SqliteConnection) {
       id TEXT PRIMARY KEY,
       guild_id TEXT,
       name TEXT,
+      purpose TEXT,
       updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS short_term_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       message_id TEXT NOT NULL,
       channel_id TEXT NOT NULL,
+      channel_name TEXT,
       user_id TEXT,
+      user_name TEXT,
+      user_is_bot INTEGER NOT NULL DEFAULT 0,
       guild_id TEXT,
       kind TEXT NOT NULL,
       content TEXT NOT NULL,
+      reply_to_message_id TEXT,
+      reply_to_user_id TEXT,
+      attachments_json TEXT,
       metadata_json TEXT,
       created_at INTEGER NOT NULL
     );
@@ -400,9 +591,11 @@ function initializeWedgeSchema(db: SqliteConnection) {
       updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS nest_items (
-      name TEXT PRIMARY KEY,
-      description TEXT,
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      notes TEXT,
       quantity INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS conversation_state (
@@ -422,10 +615,42 @@ function initializeWedgeSchema(db: SqliteConnection) {
       status TEXT NOT NULL,
       log_count INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS cognition_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      trigger_message_id TEXT,
+      channel_id TEXT NOT NULL,
+      user_id TEXT,
+      started_at INTEGER NOT NULL,
+      status TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS cognition_steps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL,
+      iteration INTEGER NOT NULL,
+      prompt TEXT NOT NULL,
+      decision_json TEXT,
+      action_json TEXT,
+      result_json TEXT,
+      error TEXT,
+      created_at INTEGER NOT NULL
+    );
   `);
+  addColumnIfMissing(db, "users", "guild_id", "TEXT");
+  addColumnIfMissing(db, "users", "details", "TEXT");
+  addColumnIfMissing(db, "channels", "purpose", "TEXT");
+  addColumnIfMissing(db, "short_term_logs", "channel_name", "TEXT");
+  addColumnIfMissing(db, "short_term_logs", "user_name", "TEXT");
+  addColumnIfMissing(db, "short_term_logs", "user_is_bot", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "short_term_logs", "reply_to_message_id", "TEXT");
+  addColumnIfMissing(db, "short_term_logs", "reply_to_user_id", "TEXT");
+  addColumnIfMissing(db, "short_term_logs", "attachments_json", "TEXT");
   addColumnIfMissing(db, "conversation_state", "last_user_id", "TEXT");
   addColumnIfMissing(db, "conversation_state", "offering_seen_at", "INTEGER");
   addColumnIfMissing(db, "conversation_state", "bored_until", "INTEGER");
+  addColumnIfMissing(db, "nest_items", "id", "INTEGER");
+  addColumnIfMissing(db, "nest_items", "notes", "TEXT");
+  addColumnIfMissing(db, "nest_items", "created_at", "INTEGER");
+  addColumnIfMissing(db, "nest_items", "updated_at", "INTEGER");
 }
 
 function addColumnIfMissing(db: SqliteConnection, table: string, column: string, definition: string) {

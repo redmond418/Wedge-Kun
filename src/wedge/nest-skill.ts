@@ -3,9 +3,11 @@ import type { WedgeDatabase } from "./storage.js";
 
 const NestInteractionSchema = z.object({
   target_channel_id: z.string().min(1),
-  action: z.enum(["add", "remove", "list", "narrate"]),
-  item: z.string().optional(),
-  description: z.string().optional(),
+  action: z.enum(["stash", "update", "look", "narrate"]),
+  item_id: z.number().int().positive().optional(),
+  name: z.string().optional(),
+  quantity: z.number().int().optional(),
+  notes: z.string().optional(),
   narration: z.string().optional(),
 });
 
@@ -17,17 +19,29 @@ export async function interactWithNest(params: {
   send: WedgeNestSend;
 }) {
   const input = NestInteractionSchema.parse(params.input);
-  if (input.action === "add" && input.item) {
-    params.db.upsertNestItem({ name: input.item, description: input.description, quantity: 1 });
+  if (input.action === "stash" && input.name) {
+    params.db.upsertNestItem({
+      name: input.name,
+      notes: input.notes ?? null,
+      quantity: input.quantity ?? 1,
+    });
+  }
+  if (input.action === "update" && (input.item_id || input.name)) {
+    params.db.upsertNestItem({
+      id: input.item_id,
+      name: input.name ?? `item:${input.item_id}`,
+      notes: input.notes ?? null,
+      quantity: input.quantity ?? 0,
+    });
   }
   const text =
     input.narration ??
-    (input.action === "list"
+    (input.action === "look"
       ? `*(ウェッジくんは巣の中身を数える: ${params.db
           .listNestItems()
           .map((item) => `${item.name} x${item.quantity}`)
           .join(", ") || "空"}.)*`
-      : `*(ウェッジくんは${input.item ?? "巣"}をいじった.)*`);
+      : `*(ウェッジくんは${input.name ?? "巣"}をいじった.)*`);
   await params.send(input.target_channel_id, text);
   params.db.insertLog({
     messageId: `nest-${Date.now()}`,

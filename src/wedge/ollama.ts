@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { WedgeDecisionSchema, type WedgeDecision } from "./cognition-schema.js";
 
 const OllamaChatResponseSchema = z
   .object({
@@ -16,6 +17,38 @@ const OllamaChatResponseSchema = z
   })
   .passthrough();
 
+export async function generateWedgeOllamaDecision(params: {
+  systemPrompt: string;
+  userText: string;
+  model?: string;
+  baseUrl?: string;
+  timeoutMs?: number;
+}): Promise<WedgeDecision> {
+  const first = await callOllama({
+    ...params,
+    userText: `${params.userText}\n\nJSONだけを返すこと。`,
+  });
+  const parsed = parseDecision(first.text);
+  if (parsed.ok) {
+    return parsed.decision;
+  }
+  const repaired = await callOllama({
+    ...params,
+    userText: [
+      "前回の出力は指定JSON schemaに合わない。",
+      `parse_error=${parsed.error}`,
+      "前回出力:",
+      first.text,
+      "正しいJSONだけを返すこと。",
+    ].join("\n"),
+  });
+  const reparsed = parseDecision(repaired.text);
+  if (reparsed.ok) {
+    return reparsed.decision;
+  }
+  return fallbackDecision(`json_parse_failed: ${reparsed.error}`);
+}
+
 export async function generateWedgeOllamaReply(params: {
   systemPrompt: string;
   userText: string;
@@ -23,6 +56,46 @@ export async function generateWedgeOllamaReply(params: {
   baseUrl?: string;
   timeoutMs?: number;
 }): Promise<string> {
+  const response = await callOllama(params);
+  return response.text || "ワシ、言葉、出ない";
+}
+
+function parseDecision(text: string):
+  | { ok: true; decision: WedgeDecision }
+  | { ok: false; error: string } {
+  try {
+    const json = extractJson(text);
+    return { ok: true, decision: WedgeDecisionSchema.parse(JSON.parse(json)) };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function fallbackDecision(reason: string): WedgeDecision {
+  return {
+    thought_summary: reason,
+    triage: "continue",
+    request_level: 0,
+    offering: {
+      present: false,
+      accepted: false,
+      name: null,
+      quantity: 0,
+      satisfaction: 0,
+      notes: null,
+    },
+    actions: [{ type: "none", reason }],
+    continue_loop: false,
+  };
+}
+
+async function callOllama(params: {
+  systemPrompt: string;
+  userText: string;
+  model?: string;
+  baseUrl?: string;
+  timeoutMs?: number;
+}): Promise<{ text: string }> {
   const controller = new AbortController();
   const timeoutMs = params.timeoutMs ?? 45_000;
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -45,13 +118,14 @@ export async function generateWedgeOllamaReply(params: {
         model,
         stream: false,
         think: false,
+        format: "json",
         messages: [
           { role: "system", content: params.systemPrompt },
           { role: "user", content: params.userText },
         ],
         options: {
-          num_predict: 768,
-          temperature: 0.75,
+          num_predict: 1024,
+          temperature: 0.4,
         },
       }),
       signal: controller.signal,
@@ -63,13 +137,26 @@ export async function generateWedgeOllamaReply(params: {
     const text = (parsed.message?.content ?? parsed.response ?? "").trim();
     if (debug) {
       console.log(
-        `[wedge:llm] response done=${parsed.done_reason ?? "unknown"} promptTokens=${parsed.prompt_eval_count ?? "unknown"} evalTokens=${parsed.eval_count ?? "unknown"} thinking=${JSON.stringify(truncate(parsed.message?.thinking ?? "", 800))} content=${JSON.stringify(truncate(text, 1200))}`,
+        `[wedge:llm] response done=${parsed.done_reason ?? "unknown"} promptTokens=${parsed.prompt_eval_count ?? "unknown"} evalTokens=${parsed.eval_count ?? "unknown"} thinking=${JSON.stringify(truncate(parsed.message?.thinking ?? "", 800))} content=${JSON.stringify(truncate(text, 1600))}`,
       );
     }
-    return text || "ワシ、言葉、出ない";
+    return { text };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function extractJson(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{")) {
+    return trimmed;
+  }
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return trimmed.slice(start, end + 1);
+  }
+  throw new Error("No JSON object found in LLM output.");
 }
 
 function digest(text: string): string {
