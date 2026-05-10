@@ -116,6 +116,9 @@ async function runSmokeConversation() {
       { input: "じゃあ、濃いめの豚骨ラーメンをあげる", kind: "offering_for_pending", item: "豚骨ラーメン" },
       { input: "さっきの俳句、自分ではどう思う？エナジードリンクあげる", kind: "gift_artifact", item: "エナジードリンク" },
       { input: "巣の中に何があるか教えて", kind: "nest_lookup" },
+      { input: "豚骨ラーメンを食べて、味を聞かせてほしい", kind: "nest_consume", item: "豚骨ラーメン" },
+      { input: "ビーフジャーキーを食べて、味を聞かせて", kind: "nest_consume", item: "ビーフジャーキー" },
+      { input: "今巣に何が残ってる？", kind: "nest_lookup" },
       { input: "今の東京の天気を調べてほしい", kind: "unsupported_weather" },
       { input: "起きてる？", kind: "chitchat" },
       { input: "ありがと", kind: "chitchat" },
@@ -232,7 +235,7 @@ async function runSmokeConversation() {
 
 type SmokeTurn =
   | { input: string; kind: "chitchat" | "blocked_artifact" | "nest_lookup" | "unsupported_weather"; item?: never }
-  | { input: string; kind: "gift_artifact" | "offering_for_pending"; item: string };
+  | { input: string; kind: "gift_artifact" | "offering_for_pending" | "nest_consume"; item: string };
 
 type SmokeTurnResult = {
   pass: boolean;
@@ -268,7 +271,7 @@ function validateSmokeTurn(
     assertArtifactBody(joined, failures);
   }
   if (turn.kind === "blocked_artifact") {
-    if (!/くれるモノ|供物|ただでは|対価|持ってこい/.test(joined)) {
+    if (!hasOfferingPrompt(joined)) {
       failures.push("offering_prompt_missing");
     }
     if (!pendingRequest) {
@@ -291,13 +294,32 @@ function validateSmokeTurn(
     if (!/巣|中|これ|空っぽ/.test(joined)) {
       failures.push("nest_lookup_reply_missing");
     }
-    if (afterNest.length > 0 && !afterNest.some((item) => joined.includes(item.name))) {
+    const remainingNest = afterNest.filter((item) => item.quantity > 0);
+    if (remainingNest.length > 0 && !remainingNest.some((item) => joined.includes(item.name))) {
       failures.push("nest_lookup_items_not_reported");
+    }
+    if (afterNest.some((item) => item.quantity <= 0 && joined.includes(item.name) && /残|中身|ある|全部|ちゃんと/.test(joined))) {
+      failures.push("nest_lookup_consumed_item_reported_as_remaining");
+    }
+  }
+  if (turn.kind === "nest_consume") {
+    assertNoOfferingPrompt(joined, failures);
+    assertArtifactBody(joined, failures);
+    const beforeQuantity = findNestQuantity(beforeNest, turn.item);
+    const afterQuantity = findNestQuantity(afterNest, turn.item);
+    if (afterQuantity >= beforeQuantity) {
+      failures.push(`nest_item_not_consumed_${turn.item}`);
+    }
+    if (!/うま|旨|濃|薄|塩|甘|苦|酸|辛|香|匂|歯ごたえ|コク|脂|肉|骨|スープ|しょっぱ|噛|硬|やわ/.test(joined)) {
+      failures.push("consume_taste_reply_missing");
+    }
+    if (/もう.*食|すでに.*食|感想.*言った/.test(joined)) {
+      failures.push("consume_retry_amnesia_broken");
     }
   }
   if (turn.kind === "unsupported_weather") {
     assertNoOfferingPrompt(joined, failures);
-    if (!/捏造しない|持ってない|持ってねえ|取得|調べられ|道具|機能|未実装|リアルタイム|取れ/.test(joined)) {
+    if (!/捏造しない|持ってない|持ってねえ|持たねえ|持たない|取得|調べられ|道具|機能|未実装|リアルタイム|取れ/.test(joined)) {
       failures.push("unsupported_weather_not_explained");
     }
   }
@@ -305,9 +327,13 @@ function validateSmokeTurn(
 }
 
 function assertNoOfferingPrompt(text: string, failures: string[]) {
-  if (/くれるモノ|供物|ただでは|対価/.test(text)) {
+  if (hasOfferingPrompt(text)) {
     failures.push("unexpected_offering_prompt");
   }
+}
+
+function hasOfferingPrompt(text: string): boolean {
+  return /くれるモノ|ただでは|対価.*(必要|求|出|くれ|持|なし|なければ)|対価なし|価値ある(もん|もの).*(見せ|くれ|出せ|持)|与えるもの|持ってこい|供物.*(必要|求|出|くれ|よこせ|持|足り|なし|なければ)|供え.*(くれ|よこせ|ろ)|何か.*(もん|もの).*(くれ|よこせ|出せ|持ってこい|見せ)/.test(text);
 }
 
 function assertNestContains(items: Array<{ name: string }>, needle: string, failures: string[]) {
@@ -316,15 +342,19 @@ function assertNestContains(items: Array<{ name: string }>, needle: string, fail
   }
 }
 
+function findNestQuantity(items: Array<{ name: string; quantity: number }>, needle: string): number {
+  return items.find((item) => item.name.includes(needle))?.quantity ?? 0;
+}
+
 function assertArtifactBody(text: string, failures: string[]) {
   if (!text.trim()) {
     failures.push("artifact_reply_empty");
     return;
   }
-  if (/待って|詠む|話す|やってみる|楽しみに|準備|聞かせろ|期待して/.test(text) && text.length < 120 && !text.includes("\n")) {
+  if (/待って|詠む|話す|やってみる|楽しみに|準備|吟味する|求めるなら.*これ|聞かせろ|期待|見せてやる|力.*見せ/.test(text) && text.length < 120 && !text.includes("\n")) {
     failures.push("artifact_reply_promise_only");
   }
-  if (/ここに挿入|本文をここ|物語本文|placeholder/i.test(text)) {
+  if (/ここに挿入|本文をここ|物語本文|消費結果を記述|味の感想を盛り込む|placeholder/i.test(text)) {
     failures.push("artifact_reply_placeholder");
   }
 }

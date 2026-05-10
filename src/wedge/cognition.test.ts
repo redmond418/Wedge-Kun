@@ -50,6 +50,7 @@ async function withDb<T>(fn: (db: Awaited<ReturnType<typeof import("./storage.js
 describe("runWedgeCognitionLoop", () => {
   afterEach(() => {
     decisions.length = 0;
+    vi.clearAllMocks();
     vi.resetModules();
   });
 
@@ -261,6 +262,126 @@ describe("runWedgeCognitionLoop", () => {
     });
   });
 
+  it("does not feed rejected user-facing content back as conversation fact during protocol redo", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    const { generateWedgeOllamaDecision } = await import("./ollama.js");
+    await withDb(async (db) => {
+      const sent: string[] = [];
+      db.upsertNestItem({ name: "豚骨ラーメン", quantity: 1, notes: null });
+      decisions.push(
+        decision({
+          thought_summary: "消費するが予告だけで終わっている。",
+          request_level: 5,
+          actions: [
+            { type: "nest_consume", name: "豚骨ラーメン", quantity: 1, reason: "味を見る。" },
+            { type: "discord_send_message", target_channel_id: "c1", content: "ワシ、待ってろ。" },
+          ],
+          continue_loop: false,
+        }),
+      );
+      decisions.push(
+        decision({
+          thought_summary: "実行済みの消費結果を見て感想を返す。",
+          request_level: 5,
+          actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "食った。濃い。脂、強い。骨の匂い、悪くない。" }],
+          continue_loop: false,
+        }),
+      );
+
+      await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "豚骨ラーメンを食べて、味を聞かせて" },
+        runtime: {
+          sendDiscordMessage: async ({ content }) => {
+            sent.push(content);
+            return { ok: true };
+          },
+        },
+      });
+
+      const calls = vi.mocked(generateWedgeOllamaDecision).mock.calls;
+      const reflectPrompt = String(calls[1]?.[0].systemPrompt ?? "");
+      expect(reflectPrompt).toContain("nest_consume");
+      expect(reflectPrompt).not.toContain("ワシ、待ってろ。");
+      expect(sent).toEqual(["食った。濃い。脂、強い。骨の匂い、悪くない。"]);
+    });
+  });
+
+  it("asks the LLM to redo nest consumption that has no item target", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    await withDb(async (db) => {
+      const sent: string[] = [];
+      db.upsertNestItem({ name: "ビーフジャーキー", quantity: 1, notes: null });
+      decisions.push(
+        decision({
+          thought_summary: "対象を指定せず消費しようとしている。",
+          request_level: 5,
+          actions: [{ type: "nest_consume", quantity: 1, reason: "味を見る。" } as WedgeDecision["actions"][number]],
+          continue_loop: false,
+        }),
+      );
+      decisions.push(
+        decision({
+          thought_summary: "対象名を指定して消費し、感想を返す。",
+          request_level: 5,
+          actions: [
+            { type: "nest_consume", name: "ビーフジャーキー", quantity: 1, reason: "味を見る。" },
+            { type: "discord_send_message", target_channel_id: "c1", content: "噛んだ。肉、濃い。塩、効いてる。" },
+          ],
+          continue_loop: false,
+        }),
+      );
+
+      await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "ビーフジャーキーを食べて味を聞かせて" },
+        runtime: {
+          sendDiscordMessage: async ({ content }) => {
+            sent.push(content);
+            return { ok: true };
+          },
+        },
+      });
+
+      expect(db.listNestItems().find((item) => item.name === "ビーフジャーキー")?.quantity).toBe(0);
+      expect(sent[0]).toContain("肉");
+    });
+  });
+
+  it("allows nest consumption with a final taste reply without converting it to offering block", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    await withDb(async (db) => {
+      const sent: string[] = [];
+      db.upsertNestItem({ name: "ビーフジャーキー", quantity: 1, notes: null });
+      decisions.push(
+        decision({
+          thought_summary: "巣のアイテムを消費して味を返す。",
+          request_level: 7,
+          actions: [
+            { type: "nest_consume", name: "ビーフジャーキー", quantity: 1, reason: "味を見る。" },
+            { type: "discord_send_message", target_channel_id: "c1", content: "食った。硬い。肉の旨味、じわっと来る。" },
+          ],
+          continue_loop: false,
+        }),
+      );
+
+      const result = await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "ビーフジャーキーを食べて、味を聞かせて" },
+        runtime: {
+          sendDiscordMessage: async ({ content }) => {
+            sent.push(content);
+            return { ok: true };
+          },
+        },
+      });
+
+      expect(result.finalTriage).toBe("continue");
+      expect(sent[0]).toContain("旨味");
+      expect(db.listNestItems().find((item) => item.name === "ビーフジャーキー")?.quantity).toBe(0);
+    });
+  });
+
   it("keeps an LLM-authored offering prompt and structurally marks it as blocked", async () => {
     const { runWedgeCognitionLoop } = await import("./cognition.js");
     await withDb(async (db) => {
@@ -296,34 +417,15 @@ describe("runWedgeCognitionLoop", () => {
   it("fails rather than inventing a reply when protocol correction still loops without context tools", async () => {
     const { runWedgeCognitionLoop } = await import("./cognition.js");
     await withDb(async (db) => {
-      decisions.push(
-        decision({
-          thought_summary: "何もしないのに続ける。",
-          actions: [{ type: "none", reason: "会話返信が必要" }],
-          continue_loop: true,
-        }),
-      );
-      decisions.push(
-        decision({
-          thought_summary: "まだ何もしないのに続ける。",
-          actions: [{ type: "none", reason: "会話返信が必要" }],
-          continue_loop: true,
-        }),
-      );
-      decisions.push(
-        decision({
-          thought_summary: "それでも何もしないのに続ける。",
-          actions: [{ type: "none", reason: "会話返信が必要" }],
-          continue_loop: true,
-        }),
-      );
-      decisions.push(
-        decision({
-          thought_summary: "最後まで何もしないのに続ける。",
-          actions: [{ type: "none", reason: "会話返信が必要" }],
-          continue_loop: true,
-        }),
-      );
+      for (let index = 0; index < 6; index += 1) {
+        decisions.push(
+          decision({
+            thought_summary: `何もしないのに続ける ${index}`,
+            actions: [{ type: "none", reason: "会話返信が必要" }],
+            continue_loop: true,
+          }),
+        );
+      }
 
       await expect(
         runWedgeCognitionLoop({

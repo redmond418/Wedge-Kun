@@ -65,5 +65,6 @@ describe("WedgeDecisionSchema", () => {
   it("keeps the schema description readable", () => {
     expect(wedgeDecisionJsonSchemaDescription()).toContain("保存してよい1文");
     expect(wedgeDecisionJsonSchemaDescription()).toContain("nest_consume");
+    expect(wedgeDecisionJsonSchemaDescription()).toContain("item_id または name");
   });
 });

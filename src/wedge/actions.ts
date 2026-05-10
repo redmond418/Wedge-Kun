@@ -58,6 +58,9 @@ export async function executeWedgeAction(params: {
       if (!action.item_id && !action.name) {
         return { ok: false, result: { error: "nest_consume requires item_id or name" } };
       }
+      const before = db.listNestItems().find((item) =>
+        action.item_id ? item.id === action.item_id : item.name === action.name,
+      );
       const item = db.consumeNestItem({
         id: action.item_id,
         name: action.name,
@@ -69,9 +72,20 @@ export async function executeWedgeAction(params: {
         channelId: params.defaultChannelId,
         content: `${item.name} x${action.quantity} consumed: ${action.reason}`,
         kind: "action",
-        metadataJson: JSON.stringify({ action: action.type, item }),
+        metadataJson: JSON.stringify({ action: action.type, item, before }),
       });
-      return { ok: true, result: item };
+      return {
+        ok: true,
+        result: {
+          id: item.id,
+          name: item.name,
+          quantity_before: before?.quantity ?? null,
+          quantity_consumed: action.quantity,
+          quantity_after: item.quantity,
+          reason: action.reason,
+          notes: item.notes,
+        },
+      };
     }
     case "nest_update": {
       if (!action.item_id && !action.name) {
@@ -85,8 +99,17 @@ export async function executeWedgeAction(params: {
       });
       return { ok: true, result: item };
     }
-    case "nest_look":
-      return { ok: true, result: db.listNestItems() };
+    case "nest_look": {
+      const items = db.listNestItems();
+      return {
+        ok: true,
+        result: {
+          remaining: items.filter((item) => item.quantity > 0),
+          consumed: items.filter((item) => item.quantity <= 0),
+          all: items,
+        },
+      };
+    }
     case "update_user_profile": {
       db.updateUserProfile({
         id: action.user_id,

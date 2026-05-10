@@ -707,6 +707,51 @@ function initializeWedgeSchema(db: SqliteConnection) {
   addColumnIfMissing(db, "nest_items", "notes", "TEXT");
   addColumnIfMissing(db, "nest_items", "created_at", "INTEGER");
   addColumnIfMissing(db, "nest_items", "updated_at", "INTEGER");
+  ensureNestItemsPrimaryKey(db);
+}
+
+function ensureNestItemsPrimaryKey(db: SqliteConnection) {
+  const columns = db.prepare("PRAGMA table_info(nest_items)").all() as Array<{ name: string; pk: number }>;
+  const idColumn = columns.find((column) => column.name === "id");
+  if (idColumn?.pk === 1) {
+    return;
+  }
+  const rows = db
+    .prepare(
+      `SELECT name,
+              notes,
+              COALESCE(quantity, 1) AS quantity,
+              COALESCE(created_at, unixepoch()) AS createdAt,
+              COALESCE(updated_at, unixepoch()) AS updatedAt
+       FROM nest_items
+       WHERE name IS NOT NULL
+       ORDER BY rowid ASC`,
+    )
+    .all() as Array<{ name: string; notes: string | null; quantity: number; createdAt: number; updatedAt: number }>;
+  db.exec(`
+    DROP TABLE IF EXISTS nest_items_legacy_without_pk;
+    ALTER TABLE nest_items RENAME TO nest_items_legacy_without_pk;
+    CREATE TABLE nest_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      notes TEXT,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+  const insert = db.prepare(
+    `INSERT INTO nest_items (name, notes, quantity, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(name) DO UPDATE SET
+       notes = COALESCE(excluded.notes, nest_items.notes),
+       quantity = nest_items.quantity + excluded.quantity,
+       updated_at = MAX(nest_items.updated_at, excluded.updated_at)`,
+  );
+  for (const row of rows) {
+    insert.run(row.name, row.notes, row.quantity, row.createdAt, row.updatedAt);
+  }
+  db.exec("DROP TABLE nest_items_legacy_without_pk");
 }
 
 function parsePendingRequest(value: string | null): WedgePendingRequest | null {

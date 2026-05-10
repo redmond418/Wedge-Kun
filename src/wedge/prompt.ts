@@ -76,7 +76,7 @@ function formatAvailableActions(): string {
     "discord_send_message: 返信/催促/確認/成果物/結果報告。required target_channel_id, content。",
     "discord_add_reaction: 文なしの短い反応。required target_channel_id, target_message_id, emoji。",
     "nest_stash: 供物を巣へ保存。required name, quantity。",
-    "nest_consume: 巣の物を食べる/使う。required item_id or name, quantity, reason。",
+    "nest_consume: 巣の物を食べる/使う。required item_id または name のどちらか一つ, quantity, reason。",
     "nest_look: 巣の中身確認。巣の確認では供物を要求せず、まずこの tool で文脈を取る。",
     "update_user_profile: 継続的ユーザー情報更新。",
     "fetch_user_recent_logs/fetch_user_avatar_context: 追加文脈取得。",

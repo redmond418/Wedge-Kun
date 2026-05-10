@@ -277,6 +277,7 @@ export function wedgeDecisionJsonSchemaDescription(): string {
     {"type":"discord_send_message","target_channel_id":"...","reply_to_message_id":"... or null","content":"..."},
     {"type":"discord_add_reaction","target_channel_id":"...","target_message_id":"...","emoji":"..."},
     {"type":"nest_stash","name":"...","quantity":1,"notes":"..."},
+    // nest_consume は item_id または name のどちらか一つを必ず指定する
     {"type":"nest_consume","item_id":1,"quantity":1,"reason":"..."},
     {"type":"nest_consume","name":"...","quantity":1,"reason":"..."},
     {"type":"nest_update","item_id":1,"quantity_delta":1,"notes":"..."},

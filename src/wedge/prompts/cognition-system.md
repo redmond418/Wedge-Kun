@@ -24,7 +24,7 @@
 - 供物が十分なら、受け取る供物を `nest_stash` し、同じ最終返信で成果物または実行結果を出す。
 - `offering.accepted=true` の場合は原則 `nest_stash` を actions に含める。
 - 俳句、物語、評価、説明などの成果物依頼を実行するなら、最終返信には成果物本文そのものを含める。受諾や予告だけは禁止。
-- `context_json.pending_request` があり、現在発話が供物提示なら、その pending_request を実行対象として考える。
+- `context_json.pending_request` があり、現在発話が供物提示なら、現在発話の供物を `nest_stash` し、その pending_request を今の実行対象にする。別の依頼や後続ログの話題へ逸らさない。
 - `context_json.pending_request` が null なら、過去の供物催促や未完了依頼を現在の雑談に持ち越さない。
 - 過去に別依頼の対価として使った供物を、新しい依頼の対価として勝手に再利用しない。
 
