@@ -30,36 +30,27 @@ Discord の message create 最上流で Wedge prefilter を通す。
 
 Wedge は「rule triage + 一発返信」ではなく、LLM が JSON で判断し、必要な action を実行し、tool result を context に追加して再思考する loop で動く。
 
-### 4.1 Loop Phases
-
 各 trigger について最大 10 iteration まで以下を繰り返す。
 
-1. **Context build**
-   - 現在日時
-   - trigger message
-   - core memory
-   - 同一チャンネルの短期ログ
-   - registry 最大 10 名
-   - nest items
-   - reply 元、添付、送信者、チャンネル情報
-   - 直前 iteration の tool result
-2. **LLM decision**
-   - LLM は JSON オブジェクトのみを返す。
-   - Markdown、コードフェンス、自然文の前置きは禁止。
-3. **Action execution**
-   - JSON の `actions` を順に実行する。
-   - 実行結果やエラーを `cognition_steps` と短期ログへ保存する。
-4. **Re-think**
-   - `continue_loop=true` なら tool result を context に追加して再度 LLM に判断させる。
-   - `continue_loop=false` なら終了する。
+1. Context build: 現在日時、trigger message、core memory、同一チャンネル短期ログ、registry、nest items、返信元、添付、送信者、チャンネル情報、直前 iteration の tool result を集める。
+2. LLM decision: LLM は JSON オブジェクトのみを返す。Markdown、コードフェンス、自然文の前置きは禁止。
+3. Action execution: JSON の `actions` を順に実行し、結果やエラーを `cognition_steps` と短期ログへ保存する。
+4. Re-think: `continue_loop=true` なら tool result を context に追加して再度 LLM に判断させ、`continue_loop=false` なら終了する。
 
-### 4.2 LLM Output Schema
+## 5. LLM Output Schema
 
 LLM の出力は Zod schema `src/wedge/cognition-schema.ts` で検証する。最低限以下を含む。
 
 ```json
 {
-  "thought_summary": "保存してよい短い判断要約",
+  "thought_summary": "保存してよい1文の判断要約",
+  "interpretation": {
+    "user_intent": "ユーザー発話の意図",
+    "referents": ["参照語の候補"],
+    "actor": "wedge | user | other | unclear",
+    "confidence": 0.0,
+    "ambiguity": null
+  },
   "triage": "ignore | block | bored | continue",
   "request_level": 0,
   "offering": {
@@ -75,130 +66,68 @@ LLM の出力は Zod schema `src/wedge/cognition-schema.ts` で検証する。�
 }
 ```
 
-JSON parse に失敗した場合は 1 回だけ repair prompt を投げる。それでも失敗した場合は、安全な fallback action を返し、プロセスを落とさない。
+JSON parse に失敗した場合は 1 回だけ repair prompt を投げる。それでも失敗した場合は、Discord へ短い fallback message を返し、プロセスを落とさない。
 
-### 4.3 Action Model
+## 6. Actions
 
-最終 action は Discord 投稿に限定しない。v1 で扱う action は以下。
+最終 action は Discord 投稿に限定しない。
 
-- `discord_send_message`
-- `discord_add_reaction`
-- `nest_stash`
-- `nest_update`
-- `nest_look`
-- `update_user_profile`
-- `fetch_user_recent_logs`
-- `fetch_user_avatar_context`
-- `write_core_memory`
-- `none`
+- `discord_send_message`: チャンネルへ発言する。
+- `discord_add_reaction`: 短い反応だけで十分なときに使う。
+- `nest_stash`: 供物や拾得物を巣に保存する。
+- `nest_consume`: 巣のアイテムを食べる、使う、消費する、数量を減らす。
+- `nest_update`: 名前、備考、数量の事務的な修正に使う。消費には使わない。
+- `nest_look`: 巣の中身確認が必要なときに使う。
+- `update_user_profile`: 呼び名、特徴、関係性などを更新する。
+- `fetch_user_recent_logs`: 特定ユーザーの過去発話を取得する。
+- `fetch_user_avatar_context`: アイコンや画像特徴を取得する。
+- `write_core_memory`: 生ログではなく、継続的に覚えるべき重要情報だけを書く。
+- `none`: 本当に何もしない。
 
 ファイル操作やターミナル操作は schema と拒否ログから始め、実行時は Windows user directory 配下の path guard を必ず通す。
 
-## 5. Triage, Offering, Boredom
+## 7. Triage, Offering, Boredom
 
 トリアージ、供物満足度、同一話題判定、飽き判定は、原則 LLM の構造化判断に寄せる。ルールベースで固定文を返さない。
 
-- 頼みごとには `request_level` を 0 から 10 で見積もる。
-- 雑談、短い説明、短い創作、呼び名をつける程度の軽い依頼は低から中程度に見積もる。実行を避けるために `request_level` を不自然に高くしない。
+- 雑談、挨拶、相槌、軽い近況確認は供物不要。
+- 物語、説明、作成、調査、判断、観察、ファイル操作、その他成果物を求める依頼は供物対象。
+- 供物対象の依頼には `request_level` を 1 以上で見積もる。
+- 供物不足で block する場合も、LLM が `discord_send_message` または `discord_add_reaction` を生成する。
+- LLM が供物不足なのに依頼本文を実行しようとした場合、runtime は送信 action を催促へ差し替える。
 - 供物は `offering` に構造化する。受け取る場合は `nest_stash` で巣へ保存する。
 - 供物が依頼の対価として十分なら、巣に保存したうえで依頼を実行する。
-- 供物不足で block する場合も、LLM が `discord_send_message` または `discord_add_reaction` を生成する。
-- 同じユーザー、同じ話題で 3 往復相当続く場合のみ bored を検討する。
+- `offering.satisfaction >= request_level` のとき、追加の供物を要求してはいけない。送信内容には依頼された成果物または実行結果を含める。
 - 5分経過、別話題、供物提示で bored は解除する。
 - 人間との自然会話や別話題では、安易に bored にしない。
 
-## 6. Storage Schema
+## 8. Reference Resolution
+
+「これ」「それ」「今渡したもの」「食べていい」などの省略表現は、直近ログ、巣アイテム、tool result から参照先を推定する。
+
+- `actor` は「依頼や許可を受けて実際に行動する主体」を表す。行為者が Wedge か user か曖昧なら、`interpretation.actor="unclear"` とし、確認メッセージを返す。
+- 確信度が低い場合は、勝手に実行しない。
+- 巣に入っているものを消費する、食べる、使う、減らす文脈では `nest_consume` を使う。
+- 消費後は `continue_loop=true` で再思考し、tool result を見てから最終返信する。
+
+## 9. Storage Schema
 
 SQLite は prepared statement のみで操作する。
 
-### users
+- `users`: `id`, `guild_id`, `name`, `call_sign`, `details`, `is_bot`, `updated_at`
+- `channels`: `id`, `guild_id`, `name`, `purpose`, `updated_at`
+- `short_term_logs`: timestamp, message, author, channel, reply, attachments, metadata を含む短期ログ
+- `core_memory`: 生ログの連結ではなく、重要で継続的に覚えるべき情報だけ
+- `nest_items`: `id`, `name`, `created_at`, `updated_at`, `quantity`, `notes`
+- `cognition_runs` / `cognition_steps`: prompt、LLM JSON、action、tool result、エラーを保存する
 
-- `id`
-- `guild_id`
-- `name`: Discord 表示名
-- `call_sign`
-- `details`: 自然言語での性格、特徴、呼び名、関係性
-- `is_bot`
-- `updated_at`
-
-### channels
-
-- `id`
-- `guild_id`
-- `name`
-- `purpose`
-- `updated_at`
-
-### short_term_logs
-
-短期ログは、除外対象以外のすべての会話と action を時系列保存する。
-
-- `timestamp`
-- `message_id`
-- `kind`
-- `content`
-- `author`: name, id, bot flag
-- `channel`: name, id, guild id
-- `reply_to_message_id`
-- `reply_to_user_id`
-- `attachments_json`
-- `metadata_json`
-
-### core_memory
-
-コアメモリは生ログの連結ではなく、重要で継続的に覚えるべき情報だけを保存する。
-
-### nest_items
-
-巣のアイテムは以下で管理する。
-
-- `id`
-- `name`
-- `created_at`
-- `updated_at`
-- `quantity`
-- `notes`
-
-ID と timestamp 以外は LLM が「何であるか」「どの文脈でもらったか」を判断する。
-
-### cognition_runs / cognition_steps
-
-各 cognition loop の prompt、LLM JSON、action、tool result、エラーを保存し、デバッグ可能にする。
-
-## 7. Prompt Files
+## 10. Prompt Files And Debug
 
 Prompt はコード直書きにしない。
 
 - `src/wedge/prompts/persona.md`
 - `src/wedge/prompts/cognition-system.md`
 
-Prompt builder は以下の構造で組み立てる。
-
-- `[persona]`
-- `[rules]`
-- `[context_json]`
-- `[available_actions]`
-- `[output_schema]`
-
-## 8. Memory Batch
-
-AM 4:00 の記憶整理バッチは短期ログを LLM に渡し、重要情報だけを core memory、users.details、channels.purpose、nest item notes へ統合する。成功時のみ古い短期ログを削除する。失敗時はログを残し、次回再試行する。
-
-起動時には未実行分を検出し、recovery batch を走らせる。
-
-## 9. Admin And Debug
-
-Discord 管理コマンドは `config/admin_users.json` の user id のみ許可する。
-
-- `!wedge_sleep <分>`
-- `!wedge_reset`
-
-CLI は最低限以下をサポートする。
-
-- `show_core_memory`
-- `show_registry <id>`
-- `force_memory_batch`
-- `dump_nest`
-- `local_chat <channel> <user> <text>`
+Prompt builder は `[persona]`, `[rules]`, `[context_json]`, `[available_actions]`, `[output_schema]` で組み立てる。
 
 LLM 入出力、JSON decision、action、tool result、最終 Discord 送信内容はデバッグログに出す。`WEDGE_DEBUG_LLM=0` で LLM 詳細ログを抑制できる。

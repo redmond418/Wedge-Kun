@@ -6,7 +6,7 @@ import { executeWedgeAction, type WedgeActionRuntime } from "./actions.js";
 import { openWedgeDatabase } from "./storage.js";
 
 describe("executeWedgeAction", () => {
-  it("executes Discord, nest, profile, and none actions", async () => {
+  it("executes Discord, nest, profile, consumption, and none actions", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-actions-"));
     const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
     const sent: unknown[] = [];
@@ -34,6 +34,12 @@ describe("executeWedgeAction", () => {
         db,
         runtime,
         defaultChannelId: "c1",
+        action: { type: "nest_consume", name: "小さな供物", quantity: 1, reason: "消費テスト。" },
+      });
+      await executeWedgeAction({
+        db,
+        runtime,
+        defaultChannelId: "c1",
         action: { type: "update_user_profile", user_id: "u1", call_sign: "テストのヒト", details: "動作確認をした。" },
       });
       await executeWedgeAction({
@@ -55,7 +61,7 @@ describe("executeWedgeAction", () => {
         action: { type: "none", reason: "no-op" },
       });
 
-      expect(db.listNestItems()[0]).toMatchObject({ name: "小さな供物", quantity: 2 });
+      expect(db.listNestItems()[0]).toMatchObject({ name: "小さな供物", quantity: 1 });
       expect(db.listRegistry(1)[0]).toMatchObject({ id: "u1", callSign: "テストのヒト" });
       expect(sent).toHaveLength(1);
       expect(reactions).toHaveLength(1);

@@ -138,6 +138,7 @@ export type WedgeDatabase = {
   listRegistry(limit?: number): WedgeRegistryEntry[];
   listNestItems(): WedgeNestItem[];
   upsertNestItem(input: z.infer<typeof NestItemSchema>): WedgeNestItem;
+  consumeNestItem(input: { id?: number; name?: string; quantity: number; reason: string }): WedgeNestItem;
   runMemoryBatch(now?: number): { logCount: number };
   createCognitionRun(input: { triggerMessageId?: string; channelId: string; userId?: string }): number;
   insertCognitionStep(input: {
@@ -439,6 +440,40 @@ export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabas
         notes: value.notes ?? null,
         quantity: value.quantity ?? 1,
         createdAt: Math.floor(Date.now() / 1000),
+        updatedAt: Math.floor(Date.now() / 1000),
+      };
+    },
+    consumeNestItem(input: { id?: number; name?: string; quantity: number; reason: string }) {
+      const quantity = Math.max(1, Math.trunc(input.quantity));
+      const row = input.id
+        ? (db
+            .prepare(
+              `SELECT id, name, notes, quantity, created_at AS createdAt, updated_at AS updatedAt
+               FROM nest_items WHERE id = ?`,
+            )
+            .get(input.id) as WedgeNestItem | undefined)
+        : (db
+            .prepare(
+              `SELECT id, name, notes, quantity, created_at AS createdAt, updated_at AS updatedAt
+               FROM nest_items WHERE name = ?`,
+            )
+            .get(input.name ?? "") as WedgeNestItem | undefined);
+      if (!row) {
+        throw new Error("nest item not found");
+      }
+      const nextQuantity = Math.max(0, row.quantity - quantity);
+      const nextNotes = [row.notes, `消費: ${input.reason}`].filter(Boolean).join("\n");
+      db.prepare(
+        `UPDATE nest_items
+         SET quantity = @quantity,
+             notes = @notes,
+             updated_at = unixepoch()
+         WHERE id = @id`,
+      ).run({ id: row.id, quantity: nextQuantity, notes: nextNotes });
+      return {
+        ...row,
+        quantity: nextQuantity,
+        notes: nextNotes,
         updatedAt: Math.floor(Date.now() / 1000),
       };
     },

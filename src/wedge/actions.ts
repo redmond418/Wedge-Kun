@@ -54,6 +54,25 @@ export async function executeWedgeAction(params: {
       });
       return { ok: true, result: item };
     }
+    case "nest_consume": {
+      if (!action.item_id && !action.name) {
+        return { ok: false, result: { error: "nest_consume requires item_id or name" } };
+      }
+      const item = db.consumeNestItem({
+        id: action.item_id,
+        name: action.name,
+        quantity: action.quantity,
+        reason: action.reason,
+      });
+      db.insertLog({
+        messageId: `wedge-nest-consume-${Date.now()}`,
+        channelId: params.defaultChannelId,
+        content: `${item.name} x${action.quantity} consumed: ${action.reason}`,
+        kind: "action",
+        metadataJson: JSON.stringify({ action: action.type, item }),
+      });
+      return { ok: true, result: item };
+    }
     case "nest_update": {
       if (!action.item_id && !action.name) {
         return { ok: false, result: { error: "nest_update requires item_id or name" } };

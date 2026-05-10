@@ -2,6 +2,19 @@ import { z } from "zod";
 
 export const WedgeTriageSchema = z.enum(["ignore", "block", "bored", "continue"]);
 
+export const WedgeActorSchema = z.enum(["wedge", "user", "other", "unclear"]);
+
+export const WedgeInterpretationSchema = z.object({
+  user_intent: z.string(),
+  referents: z.preprocess(
+    (value) => (Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : value),
+    z.array(z.string()).default([]),
+  ),
+  actor: WedgeActorSchema,
+  confidence: z.number().min(0).max(1),
+  ambiguity: z.string().nullable(),
+});
+
 export const WedgeOfferingSchema = z.object({
   present: z.boolean(),
   accepted: z.boolean(),
@@ -29,6 +42,13 @@ export const WedgeActionSchema = z.discriminatedUnion("type", [
     name: z.string().min(1),
     quantity: z.number().int().min(1).default(1),
     notes: z.string().nullable().optional(),
+  }),
+  z.object({
+    type: z.literal("nest_consume"),
+    item_id: z.number().int().positive().optional(),
+    name: z.string().min(1).optional(),
+    quantity: z.number().int().min(1).default(1),
+    reason: z.string().min(1),
   }),
   z.object({
     type: z.literal("nest_update"),
@@ -67,11 +87,13 @@ export const WedgeActionSchema = z.discriminatedUnion("type", [
 
 export const WedgeDecisionSchema = z.object({
   thought_summary: z.string(),
+  interpretation: WedgeInterpretationSchema,
   triage: WedgeTriageSchema,
   request_level: z.number().int().min(0).max(10),
   offering: WedgeOfferingSchema,
   actions: z.array(WedgeActionSchema).max(12),
   continue_loop: z.boolean(),
+  internal_source: z.enum(["normal", "legacy_normalized", "repair", "fallback"]).optional(),
 });
 
 export type WedgeDecision = z.infer<typeof WedgeDecisionSchema>;
@@ -79,7 +101,14 @@ export type WedgeAction = z.infer<typeof WedgeActionSchema>;
 
 export function wedgeDecisionJsonSchemaDescription(): string {
   return `{
-  "thought_summary": "短い判断要約。raw hidden thinkingではなく、保存してよい要約だけを書く",
+  "thought_summary": "保存してよい1文の判断要約。hidden thinkingや手順列挙を書かない。",
+  "interpretation": {
+    "user_intent": "ユーザー発話の意図を短く書く",
+    "referents": ["代名詞や省略語が指す候補"],
+    "actor": "wedge | user | other | unclear",
+    "confidence": 0.0-1.0,
+    "ambiguity": "曖昧さがなければnull"
+  },
   "triage": "ignore | block | bored | continue",
   "request_level": 0-10,
   "offering": {
@@ -94,6 +123,8 @@ export function wedgeDecisionJsonSchemaDescription(): string {
     {"type":"discord_send_message","target_channel_id":"...","reply_to_message_id":"... or null","content":"..."},
     {"type":"discord_add_reaction","target_channel_id":"...","target_message_id":"...","emoji":"..."},
     {"type":"nest_stash","name":"...","quantity":1,"notes":"..."},
+    {"type":"nest_consume","item_id":1,"quantity":1,"reason":"..."},
+    {"type":"nest_consume","name":"...","quantity":1,"reason":"..."},
     {"type":"nest_update","item_id":1,"quantity_delta":1,"notes":"..."},
     {"type":"nest_look"},
     {"type":"update_user_profile","user_id":"...","call_sign":"...","details":"..."},
@@ -102,6 +133,7 @@ export function wedgeDecisionJsonSchemaDescription(): string {
     {"type":"write_core_memory","body":"..."},
     {"type":"none","reason":"..."}
   ],
-  "continue_loop": boolean
+  "continue_loop": boolean,
+  "internal_source": "normal | legacy_normalized | repair | fallback (optional; internal use)"
 }`;
 }
