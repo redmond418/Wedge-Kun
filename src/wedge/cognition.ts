@@ -238,7 +238,7 @@ function applyOfferingConsistencyGuard(decision: WedgeDecision): {
     if (action.type !== "discord_send_message") {
       return false;
     }
-    return /もっと|持ってこい|足りない|くれるモノ|対価/.test(action.content);
+    return /足りない|くれるモノ/.test(action.content);
   });
   if (!asksForMoreOffering) {
     return { decision };

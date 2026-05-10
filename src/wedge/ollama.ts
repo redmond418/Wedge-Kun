@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   WedgeDecisionSchema,
+  wedgeDecisionOllamaFormatSchema,
   wedgeDecisionJsonSchemaDescription,
   type WedgeDecision,
 } from "./cognition-schema.js";
@@ -30,6 +31,7 @@ type ParseDefaults = {
 export type WedgeLlmDebugEvent = {
   phase:
     | "raw_output"
+    | "retry_raw_output"
     | "legacy_normalized"
     | "schema_parse_failed"
     | "repair_raw_output"
@@ -54,14 +56,31 @@ export async function generateWedgeOllamaDecision(params: {
     replyToMessageId: params.fallbackReplyToMessageId,
     userText: params.userText,
   };
-  const first = await callOllama(params);
+  const first = await callOllama({ ...params, useWedgeDecisionSchema: true });
   params.onDebug?.({ phase: "raw_output", text: first.text });
-  const parsed = parseDecision(first.text, defaults);
+  let parsed = parseDecision(first.text, defaults);
   if (parsed.ok) {
     if (parsed.decision.internal_source === "legacy_normalized") {
       params.onDebug?.({ phase: "legacy_normalized", text: first.text });
     }
     return parsed.decision;
+  }
+
+  const failedOutputs = [first.text];
+  const maxRetries = Number.parseInt(process.env.WEDGE_OLLAMA_FORMAT_RETRIES ?? "2", 10);
+  for (let attempt = 1; attempt <= Math.max(0, maxRetries); attempt += 1) {
+    params.onDebug?.({ phase: "schema_parse_failed", error: parsed.error, text: failedOutputs.at(-1) });
+    console.warn(`[wedge:llm] schema parse failed attempt=${attempt}: ${truncate(parsed.error, 600)}`);
+    const retry = await callOllama({ ...params, useWedgeDecisionSchema: true });
+    params.onDebug?.({ phase: "retry_raw_output", text: retry.text });
+    failedOutputs.push(retry.text);
+    parsed = parseDecision(retry.text, defaults);
+    if (parsed.ok) {
+      if (parsed.decision.internal_source === "legacy_normalized") {
+        params.onDebug?.({ phase: "legacy_normalized", text: retry.text });
+      }
+      return parsed.decision;
+    }
   }
 
   params.onDebug?.({ phase: "schema_parse_failed", error: parsed.error, text: first.text });
@@ -70,6 +89,7 @@ export async function generateWedgeOllamaDecision(params: {
     model: params.model,
     baseUrl: params.baseUrl,
     timeoutMs: params.timeoutMs,
+    useWedgeDecisionSchema: true,
     systemPrompt: [
       "You are a strict JSON repair function.",
       "Convert invalid model output into the WedgeDecision JSON schema.",
@@ -79,7 +99,7 @@ export async function generateWedgeOllamaDecision(params: {
     ].join("\n"),
     userText: JSON.stringify(
       {
-        raw_output: first.text,
+        raw_outputs: failedOutputs,
         parse_error: parsed.error,
         original_user_text: params.userText,
         defaults: {
@@ -94,12 +114,12 @@ export async function generateWedgeOllamaDecision(params: {
   });
   params.onDebug?.({ phase: "repair_raw_output", text: repaired.text });
   const reparsed = parseDecision(repaired.text, defaults);
-  if (reparsed.ok && !isRepairMetaDecision(reparsed.decision)) {
+  if (reparsed.ok && !isRepairMetaDecision(reparsed.decision) && !hasUnsafeRepairedUserMessage(reparsed.decision)) {
     return { ...reparsed.decision, internal_source: "repair" };
   }
 
   const repairError = reparsed.ok
-    ? "repair_output_interpreted_internal_repair_prompt_as_user_request"
+    ? "repair_output_interpreted_internal_repair_prompt_or_unsafe_user_message"
     : reparsed.error;
   params.onDebug?.({ phase: "repair_failed", error: repairError, text: repaired.text });
   console.warn(`[wedge:llm] repair failed: ${truncate(repairError, 600)}`);
@@ -120,6 +140,43 @@ export async function generateWedgeOllamaReply(params: {
 }): Promise<string> {
   const response = await callOllama(params);
   return response.text || "ワシ、言葉、出ない。";
+}
+
+export async function unloadWedgeOllamaModel(params: {
+  model?: string;
+  baseUrl?: string;
+  timeoutMs?: number;
+} = {}): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), params.timeoutMs ?? 10_000);
+  try {
+    const model = params.model ?? process.env.WEDGE_OLLAMA_MODEL ?? "gemma4:latest";
+    const baseUrl = (params.baseUrl ?? process.env.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434")
+      .trim()
+      .replace(/\/+$/, "");
+    await fetch(`${baseUrl}/api/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [],
+        stream: false,
+        keep_alive: 0,
+      }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export function describeWedgeOllamaReset(): string {
+  return [
+    "Ollama /api/chat は送信した messages 配列を会話履歴として扱う。",
+    "Wedge は毎回 system と user の2件だけを送るため、Ollamaサーバー側の会話履歴は使っていない。",
+    "モデル常駐を避けて完全に冷やすには keep_alive=0 を送るか、ollama stop <model> を実行する。",
+    "Wedge は既定で keep_alive=0 を送る。速度優先なら WEDGE_OLLAMA_KEEP_ALIVE=5m などで上書きできる。",
+  ].join("\n");
 }
 
 function parseDecision(
@@ -264,6 +321,17 @@ function isRepairMetaDecision(decision: WedgeDecision): boolean {
   return hasOnlyNoOp && asksForRepairAsTask;
 }
 
+function hasUnsafeRepairedUserMessage(decision: WedgeDecision): boolean {
+  return decision.actions.some((action) => {
+    if (action.type !== "discord_send_message") {
+      return false;
+    }
+    const asciiLetters = action.content.match(/[A-Za-z]/g)?.length ?? 0;
+    const japanese = action.content.match(/[\u3040-\u30ff\u3400-\u9fff]/g)?.length ?? 0;
+    return asciiLetters > 20 && asciiLetters > japanese;
+  });
+}
+
 function fallbackDecision(params: {
   reason: string;
   channelId?: string;
@@ -307,6 +375,7 @@ async function callOllama(params: {
   model?: string;
   baseUrl?: string;
   timeoutMs?: number;
+  useWedgeDecisionSchema?: boolean;
 }): Promise<{ text: string }> {
   const controller = new AbortController();
   const timeoutMs = params.timeoutMs ?? 45_000;
@@ -330,7 +399,8 @@ async function callOllama(params: {
         model,
         stream: false,
         think: false,
-        format: "json",
+        format: params.useWedgeDecisionSchema ? wedgeDecisionOllamaFormatSchema() : "json",
+        keep_alive: process.env.WEDGE_OLLAMA_KEEP_ALIVE ?? "0",
         messages: [
           { role: "system", content: params.systemPrompt },
           { role: "user", content: params.userText },

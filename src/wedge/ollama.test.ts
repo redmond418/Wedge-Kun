@@ -11,6 +11,7 @@ function response(content: string) {
 describe("generateWedgeOllamaDecision", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   it("does not append JSON instructions to the original user message", async () => {
@@ -43,8 +44,12 @@ describe("generateWedgeOllamaDecision", () => {
 
     const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as {
       messages: Array<{ role: string; content: string }>;
+      format: unknown;
+      keep_alive: unknown;
     };
     expect(body.messages.at(-1)?.content).toBe("調子はどう？");
+    expect(body.format).toMatchObject({ type: "object" });
+    expect(body.keep_alive).toBe("0");
   });
 
   it("normalizes legacy none without repair", async () => {
@@ -122,7 +127,7 @@ describe("generateWedgeOllamaDecision", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(decision).toMatchObject({ internal_source: "repair" });
+    expect(decision.internal_source).toBeUndefined();
     expect(JSON.stringify(decision)).not.toContain("待っててね");
   });
 
@@ -141,6 +146,7 @@ describe("generateWedgeOllamaDecision", () => {
   });
 
   it("repairs malformed JSON once with isolated repair prompt", async () => {
+    vi.stubEnv("WEDGE_OLLAMA_FORMAT_RETRIES", "0");
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(response(JSON.stringify({ action: "unknown_bad" })))
@@ -176,12 +182,52 @@ describe("generateWedgeOllamaDecision", () => {
     };
     expect(repairBody.messages[0]?.content).not.toContain("persona");
     expect(repairBody.messages[0]?.content).not.toContain("供物");
-    expect(repairBody.messages[1]?.content).toContain("raw_output");
+    expect(repairBody.messages[1]?.content).toContain("raw_outputs");
     expect(decision).toMatchObject({ internal_source: "repair" });
     expect(decision.actions[0]).toMatchObject({ type: "discord_send_message", content: "直した。" });
   });
 
+  it("retries the same decision prompt before repair", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(response(JSON.stringify({ action: "unknown_bad" })))
+      .mockResolvedValueOnce(
+        response(
+          JSON.stringify({
+            thought_summary: "再試行で正しいJSONを返す。",
+            interpretation: {
+              user_intent: "挨拶",
+              referents: [],
+              actor: "wedge",
+              confidence: 1,
+              ambiguity: null,
+            },
+            triage: "continue",
+            request_level: 0,
+            offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
+            actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "ワシ、いる。" }],
+            continue_loop: false,
+          }),
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const decision = await generateWedgeOllamaDecision({
+      systemPrompt: "system",
+      userText: "起きてる？",
+      fallbackChannelId: "c1",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { messages: unknown[] };
+    const retryBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as { messages: unknown[] };
+    expect(retryBody.messages).toEqual(firstBody.messages);
+    expect(decision.internal_source).toBeUndefined();
+    expect(decision.actions[0]).toMatchObject({ type: "discord_send_message", content: "ワシ、いる。" });
+  });
+
   it("does not treat repair prompt output as a user request", async () => {
+    vi.stubEnv("WEDGE_OLLAMA_FORMAT_RETRIES", "0");
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(response(JSON.stringify({ action: "unknown_bad" })))
@@ -228,6 +274,7 @@ describe("generateWedgeOllamaDecision", () => {
   });
 
   it("falls back to a Discord message when repair fails", async () => {
+    vi.stubEnv("WEDGE_OLLAMA_FORMAT_RETRIES", "0");
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(response(JSON.stringify({ action: "unknown_bad" })))

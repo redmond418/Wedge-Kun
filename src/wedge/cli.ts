@@ -1,9 +1,15 @@
 import { runWedgeCognitionLoop } from "./cognition.js";
 import { runWedgeMemoryRecovery } from "./cron.js";
+import { describeWedgeOllamaReset, unloadWedgeOllamaModel } from "./ollama.js";
 import { openWedgeDatabase } from "./storage.js";
 
 export async function runWedgeCli(argv = process.argv.slice(2)): Promise<number> {
   const [command, arg, ...rest] = argv;
+  if (command === "reset_ollama_model") {
+    await unloadWedgeOllamaModel();
+    console.log(describeWedgeOllamaReset());
+    return 0;
+  }
   const db = openWedgeDatabase();
   try {
     if (command === "show_core_memory") {
@@ -73,7 +79,7 @@ export async function runWedgeCli(argv = process.argv.slice(2)): Promise<number>
       return 0;
     }
     console.error(
-      "Usage: wedge <show_core_memory|show_registry <id>|force_memory_batch|dump_nest|local_chat <channel_id> <user_id> <message>>",
+      "Usage: wedge <show_core_memory|show_registry <id>|force_memory_batch|dump_nest|reset_ollama_model|local_chat <channel_id> <user_id> <message>>",
     );
     return 2;
   } finally {

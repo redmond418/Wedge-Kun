@@ -99,6 +99,160 @@ export const WedgeDecisionSchema = z.object({
 export type WedgeDecision = z.infer<typeof WedgeDecisionSchema>;
 export type WedgeAction = z.infer<typeof WedgeActionSchema>;
 
+export function wedgeDecisionOllamaFormatSchema(): object {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["thought_summary", "interpretation", "triage", "request_level", "offering", "actions", "continue_loop"],
+    properties: {
+      thought_summary: { type: "string" },
+      interpretation: {
+        type: "object",
+        additionalProperties: false,
+        required: ["user_intent", "referents", "actor", "confidence", "ambiguity"],
+        properties: {
+          user_intent: { type: "string" },
+          referents: { type: "array", items: { type: "string" } },
+          actor: { type: "string", enum: ["wedge", "user", "other", "unclear"] },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          ambiguity: { anyOf: [{ type: "string" }, { type: "null" }] },
+        },
+      },
+      triage: { type: "string", enum: ["ignore", "block", "bored", "continue"] },
+      request_level: { type: "integer", minimum: 0, maximum: 10 },
+      offering: {
+        type: "object",
+        additionalProperties: false,
+        required: ["present", "accepted", "name", "quantity", "satisfaction", "notes"],
+        properties: {
+          present: { type: "boolean" },
+          accepted: { type: "boolean" },
+          name: { anyOf: [{ type: "string" }, { type: "null" }] },
+          quantity: { type: "integer", minimum: 0 },
+          satisfaction: { type: "integer", minimum: 0, maximum: 10 },
+          notes: { anyOf: [{ type: "string" }, { type: "null" }] },
+        },
+      },
+      actions: {
+        type: "array",
+        maxItems: 12,
+        items: {
+          oneOf: [
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type", "target_channel_id", "content"],
+              properties: {
+                type: { const: "discord_send_message" },
+                target_channel_id: { type: "string" },
+                reply_to_message_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+                content: { type: "string" },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type", "target_channel_id", "target_message_id", "emoji"],
+              properties: {
+                type: { const: "discord_add_reaction" },
+                target_channel_id: { type: "string" },
+                target_message_id: { type: "string" },
+                emoji: { type: "string" },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type", "name", "quantity"],
+              properties: {
+                type: { const: "nest_stash" },
+                name: { type: "string" },
+                quantity: { type: "integer", minimum: 1 },
+                notes: { anyOf: [{ type: "string" }, { type: "null" }] },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type", "quantity", "reason"],
+              properties: {
+                type: { const: "nest_consume" },
+                item_id: { type: "integer", minimum: 1 },
+                name: { type: "string" },
+                quantity: { type: "integer", minimum: 1 },
+                reason: { type: "string" },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type"],
+              properties: {
+                type: { const: "nest_update" },
+                item_id: { type: "integer", minimum: 1 },
+                name: { type: "string" },
+                quantity_delta: { type: "integer" },
+                notes: { anyOf: [{ type: "string" }, { type: "null" }] },
+              },
+            },
+            { type: "object", additionalProperties: false, required: ["type"], properties: { type: { const: "nest_look" } } },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type", "user_id"],
+              properties: {
+                type: { const: "update_user_profile" },
+                user_id: { type: "string" },
+                call_sign: { anyOf: [{ type: "string" }, { type: "null" }] },
+                details: { anyOf: [{ type: "string" }, { type: "null" }] },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type", "user_id"],
+              properties: {
+                type: { const: "fetch_user_recent_logs" },
+                user_id: { type: "string" },
+                limit: { type: "integer", minimum: 1, maximum: 50 },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type", "user_id"],
+              properties: {
+                type: { const: "fetch_user_avatar_context" },
+                user_id: { type: "string" },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type", "body"],
+              properties: {
+                type: { const: "write_core_memory" },
+                body: { type: "string" },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: false,
+              required: ["type"],
+              properties: {
+                type: { const: "none" },
+                reason: { type: "string" },
+              },
+            },
+          ],
+        },
+      },
+      continue_loop: { type: "boolean" },
+      internal_source: { type: "string", enum: ["normal", "legacy_normalized", "repair", "fallback"] },
+    },
+  };
+}
+
 export function wedgeDecisionJsonSchemaDescription(): string {
   return `{
   "thought_summary": "保存してよい1文の判断要約。hidden thinkingや手順列挙を書かない。",
