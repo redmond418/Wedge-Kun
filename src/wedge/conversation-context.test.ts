@@ -50,6 +50,8 @@ describe("Wedge short-term conversation context", () => {
       expect(prompt).toContain("[rules]");
       expect(prompt).toContain("[context_json]");
       expect(prompt).toContain("short_term_logs");
+      expect(prompt).toContain("conversation_focus");
+      expect(prompt).toContain("previous_same_user_message");
       expect(prompt).toContain("お礼を渡す");
       expect(prompt).toContain("それでお願い");
       expect(prompt).toContain('"call_sign": "ニンゲン"');

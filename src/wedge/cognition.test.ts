@@ -41,7 +41,7 @@ describe("runWedgeCognitionLoop", () => {
           triage: "continue",
           request_level: 0,
           offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-          actions: [{ type: "none", reason: "keep looping" }],
+          actions: [{ type: "nest_look" }],
           continue_loop: true,
         });
       }
@@ -140,6 +140,188 @@ describe("runWedgeCognitionLoop", () => {
 
       expect(result).toMatchObject({ finalTriage: "continue", actionCount: 1 });
       expect(sent[0]).toContain("形");
+      expect(sent[0]).not.toContain("くれるモノ");
+    } finally {
+      db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not offering-gate chitchat even when the model invents a request level", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    const { openWedgeDatabase } = await import("./storage.js");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-chitchat-gate-"));
+    const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
+    const sent: string[] = [];
+    try {
+      decisions.push({
+        thought_summary: "雑談を誤って作業依頼として扱っている。",
+        interpretation: {
+          user_intent: "Greeting and small talk",
+          referents: ["weather"],
+          actor: "user",
+          confidence: 1,
+          ambiguity: null,
+        },
+        triage: "continue",
+        request_level: 3,
+        offering: {
+          present: true,
+          accepted: false,
+          name: "conversation_continuation_response",
+          quantity: 1,
+          satisfaction: 0,
+          notes: "not a real offering",
+        },
+        actions: [
+          {
+            type: "discord_send_message",
+            target_channel_id: "c1",
+            content: "ワシ、起きた。空、よさそう。",
+          },
+        ],
+        continue_loop: false,
+      });
+
+      const result = await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "おはよう、今日もいい天気だね" },
+        runtime: {
+          sendDiscordMessage: async ({ content }) => {
+            sent.push(content);
+            return { ok: true };
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ finalTriage: "continue", actionCount: 1 });
+      expect(sent[0]).toContain("空");
+      expect(sent[0]).not.toContain("くれるモノ");
+    } finally {
+      db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stops non-expanding loops and replaces invalid no-op profile updates for chitchat", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    const { openWedgeDatabase } = await import("./storage.js");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-noop-loop-"));
+    const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
+    const sent: string[] = [];
+    try {
+      decisions.push({
+        thought_summary: "雑談なのに不要なprofile更新と再思考を選んでいる。",
+        interpretation: {
+          user_intent: "Check-in",
+          referents: [],
+          actor: "user",
+          confidence: 1,
+          ambiguity: null,
+        },
+        triage: "continue",
+        request_level: 1,
+        offering: {
+          present: true,
+          accepted: false,
+          name: "acknowledgement_and_redirection_to_core_topic",
+          quantity: 1,
+          satisfaction: 0,
+          notes: null,
+        },
+        actions: [{ type: "update_user_profile", user_id: "N/A", details: "No profile update needed." }],
+        continue_loop: true,
+      });
+
+      const result = await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "大丈夫？" },
+        runtime: {
+          sendDiscordMessage: async ({ content }) => {
+            sent.push(content);
+            return { ok: true };
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ iterations: 1, finalTriage: "continue", actionCount: 1 });
+      expect(sent[0]).not.toContain("くれるモノ");
+      expect(sent[0]).toContain("ワシ");
+    } finally {
+      db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers explicit offerings when the model misses them", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    const { openWedgeDatabase } = await import("./storage.js");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-offering-recover-"));
+    const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
+    const sent: string[] = [];
+    try {
+      decisions.push({
+        thought_summary: "供物つき依頼だが供物を見落としている。",
+        interpretation: {
+          user_intent: "俳句を詠む依頼",
+          referents: ["ビーフジャーキー"],
+          actor: "wedge",
+          confidence: 1,
+          ambiguity: null,
+        },
+        triage: "continue",
+        request_level: 3,
+        offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
+        actions: [
+          {
+            type: "discord_send_message",
+            target_channel_id: "c1",
+            content: "干し肉や 風の端っこ 噛む夜ぞ",
+          },
+        ],
+        continue_loop: false,
+      });
+      decisions.push({
+        thought_summary: "供物を巣にしまったので依頼を実行する。",
+        interpretation: {
+          user_intent: "俳句を詠む依頼",
+          referents: ["ビーフジャーキー"],
+          actor: "wedge",
+          confidence: 1,
+          ambiguity: null,
+        },
+        triage: "continue",
+        request_level: 3,
+        offering: { present: true, accepted: true, name: "ビーフジャーキー", quantity: 1, satisfaction: 3, notes: null },
+        actions: [
+          {
+            type: "discord_send_message",
+            target_channel_id: "c1",
+            content: "干し肉や 風の端っこ 噛む夜ぞ",
+          },
+        ],
+        continue_loop: false,
+      });
+
+      const result = await runWedgeCognitionLoop({
+        db,
+        trigger: {
+          kind: "local_chat",
+          channelId: "c1",
+          messageId: "m1",
+          userId: "u1",
+          text: "ビーフジャーキーあげる。なんでもいいから俳句を詠んでほしい",
+        },
+        runtime: {
+          sendDiscordMessage: async ({ content }) => {
+            sent.push(content);
+            return { ok: true };
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ iterations: 2, finalTriage: "continue", actionCount: 2 });
+      expect(sent[0]).toContain("干し肉");
       expect(sent[0]).not.toContain("くれるモノ");
     } finally {
       db.close();

@@ -43,6 +43,7 @@ export function buildWedgeSystemPrompt(params: {
     now: (params.context.now ?? new Date()).toISOString(),
     iteration: params.context.iteration,
     trigger: params.context.trigger,
+    conversation_focus: buildConversationFocus(params.context.trigger, recentLogs),
     salient_facts: buildSalientFacts(recentLogs, nestItems),
     short_term_logs: recentLogs.slice(-4).map(formatShortTermLog),
     core_memory: truncateForPrompt(params.db.getCoreMemoryText(), 1200) || null,
@@ -73,63 +74,90 @@ function formatAvailableActions(): string {
     [
       {
         type: "discord_send_message",
-        purpose: "チャンネルへ発言する。返信、催促、確認、物語、説明、結果報告に使う。",
+        purpose: "返信、催促、確認、成果物、結果報告をチャンネルへ送る。",
         required: ["target_channel_id", "content"],
       },
       {
         type: "discord_add_reaction",
-        purpose: "短い反応だけで十分なときに使う。返信文が不要ならこちらを選ぶ。",
+        purpose: "返信文が不要な短い反応。",
         required: ["target_channel_id", "target_message_id", "emoji"],
       },
       {
         type: "nest_stash",
-        purpose: "供物や取得物を巣に保存する。供物を受け取るなら必ず使う。",
+        purpose: "供物や取得物を巣に保存する。",
         required: ["name", "quantity"],
       },
       {
         type: "nest_consume",
-        purpose: "巣のアイテムを食べる、使う、消費する。数量を減らし、理由を記録する。",
+        purpose: "巣のアイテムを食べる、使う、消費する。",
         required: ["item_id or name", "quantity", "reason"],
       },
       {
         type: "nest_update",
-        purpose: "巣アイテムの名前、備考、数量を事務的に修正する。消費には使わない。",
+        purpose: "巣アイテムの事務的な修正。消費には使わない。",
         required: ["item_id or name"],
       },
       {
         type: "nest_look",
-        purpose: "巣の中身確認が必要なとき、参照先が曖昧なときに使う。",
+        purpose: "巣の中身確認、参照先確認。",
         required: [],
       },
       {
         type: "update_user_profile",
-        purpose: "呼び名、特徴、関係性など継続的に覚えるべきユーザー情報を更新する。",
+        purpose: "継続的に覚えるべきユーザー情報を更新する。",
         required: ["user_id"],
       },
       {
         type: "fetch_user_recent_logs",
-        purpose: "特定ユーザーの過去発話が必要なときに使う。",
+        purpose: "特定ユーザーの過去発話を取得する。",
         required: ["user_id"],
       },
       {
         type: "fetch_user_avatar_context",
-        purpose: "ユーザーアイコンや画像特徴が必要なときに使う。",
+        purpose: "ユーザーアイコンや画像特徴を取得する。",
         required: ["user_id"],
       },
       {
         type: "write_core_memory",
-        purpose: "重要で継続的に覚えるべき情報だけをコアメモリに書く。生ログ保存には使わない。",
+        purpose: "重要で継続的に覚えるべき情報だけを書く。",
         required: ["body"],
       },
       {
         type: "none",
-        purpose: "本当に何もしないときだけ使う。",
+        purpose: "本当に何もしない。",
         required: [],
       },
     ],
     null,
     2,
   );
+}
+
+function buildConversationFocus(trigger: WedgePromptContext["trigger"], logs: WedgeShortTermLog[]) {
+  const previousUserLog = [...logs]
+    .reverse()
+    .find((log) => log.kind === "message" && log.userId && log.userId !== trigger.userId);
+  const previousSameUserLog = [...logs]
+    .reverse()
+    .find((log) => log.kind === "message" && log.userId === trigger.userId && log.messageId !== trigger.messageId);
+  const previousWedgeLog = [...logs].reverse().find((log) => log.kind === "action" || log.userIsBot === 1);
+  return {
+    current_user_text: trigger.text ?? "",
+    previous_same_user_message: previousSameUserLog ? formatFocusLog(previousSameUserLog) : null,
+    previous_other_message: previousUserLog ? formatFocusLog(previousUserLog) : null,
+    previous_wedge_action_or_reply: previousWedgeLog ? formatFocusLog(previousWedgeLog) : null,
+  };
+}
+
+function formatFocusLog(log: WedgeShortTermLog) {
+  return {
+    timestamp: log.createdAt,
+    message_id: log.messageId,
+    author_name: log.userName,
+    author_id: log.userId,
+    is_bot: log.userIsBot === 1,
+    content: truncateForPrompt(log.content, 180),
+  };
 }
 
 export function formatShortTermLogs(logs: WedgeShortTermLog[]): string {
