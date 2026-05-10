@@ -16,72 +16,73 @@ vi.mock("./ollama.js", () => ({
   }),
 }));
 
+function decision(overrides: Partial<WedgeDecision>): WedgeDecision {
+  return {
+    thought_summary: "LLMが判断する。",
+    interpretation: {
+      user_intent: "会話",
+      referents: [],
+      actor: "wedge",
+      confidence: 1,
+      ambiguity: null,
+    },
+    triage: "continue",
+    request_level: 0,
+    offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
+    actions: [],
+    continue_loop: false,
+    ...overrides,
+  };
+}
+
+async function withDb<T>(fn: (db: Awaited<ReturnType<typeof import("./storage.js").openWedgeDatabase>>) => Promise<T>) {
+  const { openWedgeDatabase } = await import("./storage.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-cognition-"));
+  const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
+  try {
+    return await fn(db);
+  } finally {
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 describe("runWedgeCognitionLoop", () => {
   afterEach(() => {
     decisions.length = 0;
     vi.resetModules();
   });
 
-  it("stops at the configured iteration limit", async () => {
+  it("fails instead of sending a fixed fallback at the iteration limit", async () => {
     const { runWedgeCognitionLoop } = await import("./cognition.js");
-    const { openWedgeDatabase } = await import("./storage.js");
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-loop-"));
-    const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
-    try {
+    await withDb(async (db) => {
       for (let i = 0; i < 3; i += 1) {
-        decisions.push({
-          thought_summary: `step ${i}`,
-          interpretation: {
-            user_intent: "継続",
-            referents: [],
-            actor: "wedge",
-            confidence: 1,
-            ambiguity: null,
-          },
-          triage: "continue",
-          request_level: 0,
-          offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-          actions: [{ type: "nest_look" }],
-          continue_loop: true,
-        });
+        decisions.push(decision({ actions: [{ type: "nest_stash", name: `石-${i}`, quantity: 1, notes: "loop test" }], continue_loop: true }));
       }
 
-      const result = await runWedgeCognitionLoop({
-        db,
-        maxIterations: 3,
-        trigger: { kind: "local_chat", channelId: "c1", userId: "u1", text: "続けて" },
-      });
-
-      expect(result).toMatchObject({ iterations: 3, actionCount: 3 });
+      await expect(
+        runWedgeCognitionLoop({
+          db,
+          maxIterations: 3,
+          trigger: { kind: "local_chat", channelId: "c1", userId: "u1", text: "続けて" },
+        }),
+      ).rejects.toThrow("wedge_cognition_loop_limit");
       expect(db.listRecentLogs("c1").at(-1)?.content).toContain("iteration limit");
-    } finally {
-      db.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
-  it("replaces underpaid request output with an offering prompt", async () => {
+  it("uses the LLM-generated block message and stores pending_request", async () => {
     const { runWedgeCognitionLoop } = await import("./cognition.js");
-    const { openWedgeDatabase } = await import("./storage.js");
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-offering-gate-"));
-    const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
-    const sent: string[] = [];
-    try {
-      decisions.push({
-        thought_summary: "供物なしで物語を出そうとしている。",
-        interpretation: {
-          user_intent: "物語を聞きたい",
-          referents: [],
-          actor: "wedge",
-          confidence: 1,
-          ambiguity: null,
-        },
-        triage: "continue",
-        request_level: 3,
-        offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-        actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "昔..." }],
-        continue_loop: false,
-      });
+    await withDb(async (db) => {
+      const sent: string[] = [];
+      decisions.push(
+        decision({
+          thought_summary: "供物がないので催促する。",
+          triage: "block",
+          request_level: 3,
+          actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "それ、ワシの腹、動かん。何か寄越せ。" }],
+        }),
+      );
 
       const result = await runWedgeCognitionLoop({
         db,
@@ -95,223 +96,85 @@ describe("runWedgeCognitionLoop", () => {
       });
 
       expect(result).toMatchObject({ finalTriage: "block", actionCount: 1 });
-      expect(sent[0]).toContain("くれるモノ");
-      expect(sent[0]).not.toContain("昔");
-    } finally {
-      db.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+      expect(sent[0]).toBe("それ、ワシの腹、動かん。何か寄越せ。");
+      expect(db.getConversationState("c1").pendingRequest?.text).toBe("物語を話して");
+    });
   });
 
-  it("does not offering-gate fallback decisions", async () => {
+  it("fulfills pending_request only from an LLM decision", async () => {
     const { runWedgeCognitionLoop } = await import("./cognition.js");
-    const { openWedgeDatabase } = await import("./storage.js");
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-fallback-gate-"));
-    const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
-    const sent: string[] = [];
-    try {
-      decisions.push({
-        thought_summary: "LLM出力の形式修復に失敗したため、安全な短文で返信する。",
-        interpretation: {
-          user_intent: "形式崩れにより判定不能",
-          referents: [],
-          actor: "unclear",
-          confidence: 0,
-          ambiguity: "parse failed",
+    await withDb(async (db) => {
+      const sent: string[] = [];
+      const runtime = {
+        sendDiscordMessage: async ({ content }: { content: string }) => {
+          sent.push(content);
+          return { ok: true };
         },
-        triage: "continue",
-        request_level: 0,
-        offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-        actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "ワシ、言葉、形、崩れた。" }],
-        continue_loop: false,
-        internal_source: "fallback",
-      });
-
-      const result = await runWedgeCognitionLoop({
-        db,
-        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "物語を話して" },
-        runtime: {
-          sendDiscordMessage: async ({ content }) => {
-            sent.push(content);
-            return { ok: true };
-          },
-        },
-      });
-
-      expect(result).toMatchObject({ finalTriage: "continue", actionCount: 1 });
-      expect(sent[0]).toContain("形");
-      expect(sent[0]).not.toContain("くれるモノ");
-    } finally {
-      db.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("does not offering-gate chitchat even when the model invents a request level", async () => {
-    const { runWedgeCognitionLoop } = await import("./cognition.js");
-    const { openWedgeDatabase } = await import("./storage.js");
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-chitchat-gate-"));
-    const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
-    const sent: string[] = [];
-    try {
-      decisions.push({
-        thought_summary: "雑談を誤って作業依頼として扱っている。",
-        interpretation: {
-          user_intent: "Greeting and small talk",
-          referents: ["weather"],
-          actor: "user",
-          confidence: 1,
-          ambiguity: null,
-        },
-        triage: "continue",
-        request_level: 3,
-        offering: {
-          present: true,
-          accepted: false,
-          name: "conversation_continuation_response",
-          quantity: 1,
-          satisfaction: 0,
-          notes: "not a real offering",
-        },
-        actions: [
-          {
-            type: "discord_send_message",
-            target_channel_id: "c1",
-            content: "ワシ、起きた。空、よさそう。",
-          },
-        ],
-        continue_loop: false,
-      });
-
-      const result = await runWedgeCognitionLoop({
-        db,
-        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "おはよう、今日もいい天気だね" },
-        runtime: {
-          sendDiscordMessage: async ({ content }) => {
-            sent.push(content);
-            return { ok: true };
-          },
-        },
-      });
-
-      expect(result).toMatchObject({ finalTriage: "continue", actionCount: 1 });
-      expect(sent[0]).toContain("空");
-      expect(sent[0]).not.toContain("くれるモノ");
-    } finally {
-      db.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("stops non-expanding loops and replaces invalid no-op profile updates for chitchat", async () => {
-    const { runWedgeCognitionLoop } = await import("./cognition.js");
-    const { openWedgeDatabase } = await import("./storage.js");
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-noop-loop-"));
-    const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
-    const sent: string[] = [];
-    try {
-      decisions.push({
-        thought_summary: "雑談なのに不要なprofile更新と再思考を選んでいる。",
-        interpretation: {
-          user_intent: "Check-in",
-          referents: [],
-          actor: "user",
-          confidence: 1,
-          ambiguity: null,
-        },
-        triage: "continue",
-        request_level: 1,
-        offering: {
-          present: true,
-          accepted: false,
-          name: "acknowledgement_and_redirection_to_core_topic",
-          quantity: 1,
-          satisfaction: 0,
-          notes: null,
-        },
-        actions: [{ type: "update_user_profile", user_id: "N/A", details: "No profile update needed." }],
-        continue_loop: true,
-      });
-
-      const result = await runWedgeCognitionLoop({
-        db,
-        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "大丈夫？" },
-        runtime: {
-          sendDiscordMessage: async ({ content }) => {
-            sent.push(content);
-            return { ok: true };
-          },
-        },
-      });
-
-      expect(result).toMatchObject({ iterations: 1, finalTriage: "continue", actionCount: 1 });
-      expect(sent[0]).not.toContain("くれるモノ");
-      expect(sent[0]).toContain("ワシ");
-    } finally {
-      db.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("recovers explicit offerings when the model misses them", async () => {
-    const { runWedgeCognitionLoop } = await import("./cognition.js");
-    const { openWedgeDatabase } = await import("./storage.js");
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wedge-offering-recover-"));
-    const db = openWedgeDatabase(path.join(dir, "memory.sqlite"));
-    const sent: string[] = [];
-    try {
-      decisions.push({
-        thought_summary: "供物つき依頼だが供物を見落としている。",
-        interpretation: {
-          user_intent: "俳句を詠む依頼",
-          referents: ["ビーフジャーキー"],
-          actor: "wedge",
-          confidence: 1,
-          ambiguity: null,
-        },
-        triage: "continue",
-        request_level: 3,
-        offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-        actions: [
-          {
-            type: "discord_send_message",
-            target_channel_id: "c1",
-            content: "干し肉や 風の端っこ 噛む夜ぞ",
-          },
-        ],
-        continue_loop: false,
-      });
-      decisions.push({
-        thought_summary: "供物を巣にしまったので依頼を実行する。",
-        interpretation: {
-          user_intent: "俳句を詠む依頼",
-          referents: ["ビーフジャーキー"],
-          actor: "wedge",
-          confidence: 1,
-          ambiguity: null,
-        },
-        triage: "continue",
-        request_level: 3,
-        offering: { present: true, accepted: true, name: "ビーフジャーキー", quantity: 1, satisfaction: 3, notes: null },
-        actions: [
-          {
-            type: "discord_send_message",
-            target_channel_id: "c1",
-            content: "干し肉や 風の端っこ 噛む夜ぞ",
-          },
-        ],
-        continue_loop: false,
-      });
-
-      const result = await runWedgeCognitionLoop({
-        db,
-        trigger: {
-          kind: "local_chat",
-          channelId: "c1",
-          messageId: "m1",
+      };
+      db.setConversationState("c1", {
+        pendingRequest: {
+          text: "短い昔話を話して",
           userId: "u1",
-          text: "ビーフジャーキーあげる。なんでもいいから俳句を詠んでほしい",
+          userName: "u1",
+          messageId: "m1",
+          requestLevel: 3,
+          createdAt: Date.now(),
         },
+      });
+      decisions.push(
+        decision({
+          thought_summary: "供物で未完了依頼を実行する。",
+          request_level: 3,
+          offering: { present: true, accepted: true, name: "濃いラーメン", quantity: 1, satisfaction: 4, notes: "昔話の対価" },
+          actions: [
+            { type: "nest_stash", name: "濃いラーメン", quantity: 1, notes: "昔話の対価" },
+            {
+              type: "discord_send_message",
+              target_channel_id: "c1",
+              content:
+                "昔、穴の底に小さな灯りがあった。誰も近づかんかったが、ワシだけ見に行った。灯りは腹を空かせていて、影を少し食った。次の朝、村の影は丸くなった。ニンゲンども、それから穴に挨拶するようになった。"
+                + "ワシはその穴を巣にした。灯りは今も、ときどき笑う。",
+            },
+          ],
+        }),
+      );
+
+      const result = await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m2", userId: "u1", text: "ラーメンあげる" },
+        runtime,
+      });
+
+      expect(result).toMatchObject({ finalTriage: "continue", actionCount: 2 });
+      expect(db.getConversationState("c1").pendingRequest).toBeUndefined();
+      expect(db.listNestItems()[0]?.name).toBe("濃いラーメン");
+      expect(sent[0]).toContain("灯り");
+    });
+  });
+
+  it("lets the LLM use nest_look, then lets the next LLM turn explain the tool result", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    await withDb(async (db) => {
+      db.upsertNestItem({ name: "ドーナツ", quantity: 2, notes: null });
+      const sent: string[] = [];
+      decisions.push(
+        decision({
+          thought_summary: "巣を見る。",
+          actions: [{ type: "nest_look" }],
+          continue_loop: true,
+        }),
+      );
+      decisions.push(
+        decision({
+          thought_summary: "巣の中身を説明する。",
+          actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "巣、ドーナツ二つ。ワシの宝。" }],
+          continue_loop: false,
+        }),
+      );
+
+      const result = await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "巣の中に何がある？" },
         runtime: {
           sendDiscordMessage: async ({ content }) => {
             sent.push(content);
@@ -320,12 +183,180 @@ describe("runWedgeCognitionLoop", () => {
         },
       });
 
-      expect(result).toMatchObject({ iterations: 2, finalTriage: "continue", actionCount: 2 });
-      expect(sent[0]).toContain("干し肉");
-      expect(sent[0]).not.toContain("くれるモノ");
-    } finally {
-      db.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+      expect(result).toMatchObject({ iterations: 2, actionCount: 2 });
+      expect(sent[0]).toContain("ドーナツ");
+    });
+  });
+
+  it("treats LLM text with a stray continue_loop as a structural protocol fix", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    await withDb(async (db) => {
+      const sent: string[] = [];
+      decisions.push(
+        decision({
+          thought_summary: "返信は決まっているが誤って続行にした。",
+          actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "まだ起きてる。" }],
+          continue_loop: true,
+        }),
+      );
+      const result = await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "起きてる？" },
+        runtime: {
+          sendDiscordMessage: async ({ content }) => {
+            sent.push(content);
+            return { ok: true };
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ iterations: 1, actionCount: 1 });
+      expect(sent).toEqual(["まだ起きてる。"]);
+    });
+  });
+
+  it("asks the LLM to redo artifact replies that only promise future output", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    await withDb(async (db) => {
+      const sent: string[] = [];
+      decisions.push(
+        decision({
+          thought_summary: "供物を受け取ったが予告だけで終わっている。",
+          request_level: 5,
+          offering: { present: true, accepted: true, name: "菓子", quantity: 1, satisfaction: 6, notes: "創作の対価" },
+          actions: [
+            { type: "nest_stash", name: "菓子", quantity: 1, notes: "創作の対価" },
+            { type: "discord_send_message", target_channel_id: "c1", content: "詠んでやる。楽しみに待て。" },
+          ],
+          continue_loop: false,
+        }),
+      );
+      decisions.push(
+        decision({
+          thought_summary: "成果物本文を含めて返す。",
+          request_level: 5,
+          offering: { present: true, accepted: true, name: "菓子", quantity: 1, satisfaction: 6, notes: "創作の対価" },
+          actions: [
+            { type: "nest_stash", name: "菓子", quantity: 1, notes: "創作の対価" },
+            { type: "discord_send_message", target_channel_id: "c1", content: "菓子、受け取った。\n穴の底\n甘い光が\nワシを呼ぶ" },
+          ],
+          continue_loop: false,
+        }),
+      );
+
+      const result = await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "お菓子あげるから俳句を詠んで" },
+        runtime: {
+          sendDiscordMessage: async ({ content }) => {
+            sent.push(content);
+            return { ok: true };
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ iterations: 1, actionCount: 2 });
+      expect(sent[0]).toContain("穴の底");
+      expect(sent[0]).not.toContain("楽しみに待て");
+    });
+  });
+
+  it("keeps an LLM-authored offering prompt and structurally marks it as blocked", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    await withDb(async (db) => {
+      const sent: string[] = [];
+      decisions.push(
+        decision({
+          thought_summary: "供物不足なので催促文を返す。",
+          triage: "continue",
+          request_level: 5,
+          offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
+          actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "その話、タダでは出ん。対価、持ってこい。" }],
+          continue_loop: false,
+        }),
+      );
+
+      const result = await runWedgeCognitionLoop({
+        db,
+        trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "昔話を話して" },
+        runtime: {
+          sendDiscordMessage: async ({ content }) => {
+            sent.push(content);
+            return { ok: true };
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ finalTriage: "block", actionCount: 1 });
+      expect(sent).toEqual(["その話、タダでは出ん。対価、持ってこい。"]);
+      expect(db.getConversationState("c1").pendingRequest?.text).toBe("昔話を話して");
+    });
+  });
+
+  it("fails rather than inventing a reply when protocol correction still loops without context tools", async () => {
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    await withDb(async (db) => {
+      decisions.push(
+        decision({
+          thought_summary: "何もしないのに続ける。",
+          actions: [{ type: "none", reason: "会話返信が必要" }],
+          continue_loop: true,
+        }),
+      );
+      decisions.push(
+        decision({
+          thought_summary: "まだ何もしないのに続ける。",
+          actions: [{ type: "none", reason: "会話返信が必要" }],
+          continue_loop: true,
+        }),
+      );
+      decisions.push(
+        decision({
+          thought_summary: "それでも何もしないのに続ける。",
+          actions: [{ type: "none", reason: "会話返信が必要" }],
+          continue_loop: true,
+        }),
+      );
+      decisions.push(
+        decision({
+          thought_summary: "最後まで何もしないのに続ける。",
+          actions: [{ type: "none", reason: "会話返信が必要" }],
+          continue_loop: true,
+        }),
+      );
+
+      await expect(
+        runWedgeCognitionLoop({
+          db,
+          trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "大丈夫？" },
+        }),
+      ).rejects.toThrow("wedge_llm_protocol_invalid");
+    });
+  });
+
+  it("does not invent a reply when the LLM JSON pipeline fails", async () => {
+    vi.resetModules();
+    vi.doMock("./ollama.js", () => ({
+      generateWedgeOllamaDecision: vi.fn(async () => {
+        throw new Error("wedge_llm_json_failed: bad json");
+      }),
+    }));
+    const { runWedgeCognitionLoop } = await import("./cognition.js");
+    await withDb(async (db) => {
+      const sent: string[] = [];
+      await expect(
+        runWedgeCognitionLoop({
+          db,
+          trigger: { kind: "local_chat", channelId: "c1", messageId: "m1", userId: "u1", text: "こんにちは" },
+          runtime: {
+            sendDiscordMessage: async ({ content }) => {
+              sent.push(content);
+              return { ok: true };
+            },
+          },
+        }),
+      ).rejects.toThrow("wedge_llm_json_failed");
+      expect(sent).toEqual([]);
+    });
   });
 });

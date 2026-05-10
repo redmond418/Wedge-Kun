@@ -8,6 +8,24 @@ function response(content: string) {
   } as Response;
 }
 
+function validDecision(content = "ワシ、いる。") {
+  return JSON.stringify({
+    thought_summary: "短く返信する。",
+    interpretation: {
+      user_intent: "挨拶",
+      referents: [],
+      actor: "wedge",
+      confidence: 1,
+      ambiguity: null,
+    },
+    triage: "continue",
+    request_level: 0,
+    offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
+    actions: [{ type: "discord_send_message", target_channel_id: "c1", content }],
+    continue_loop: false,
+  });
+}
+
 describe("generateWedgeOllamaDecision", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -15,25 +33,7 @@ describe("generateWedgeOllamaDecision", () => {
   });
 
   it("does not append JSON instructions to the original user message", async () => {
-    const fetchMock = vi.fn(async () =>
-      response(
-        JSON.stringify({
-          thought_summary: "短く返信する。",
-          interpretation: {
-            user_intent: "挨拶",
-            referents: [],
-            actor: "wedge",
-            confidence: 1,
-            ambiguity: null,
-          },
-          triage: "continue",
-          request_level: 0,
-          offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-          actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "ワシ、いる。" }],
-          continue_loop: false,
-        }),
-      ),
-    );
+    const fetchMock = vi.fn(async () => response(validDecision()));
     vi.stubGlobal("fetch", fetchMock);
 
     await generateWedgeOllamaDecision({
@@ -42,7 +42,8 @@ describe("generateWedgeOllamaDecision", () => {
       fallbackChannelId: "c1",
     });
 
-    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as {
+    const fetchCalls = fetchMock.mock.calls as unknown as Array<[string, { body?: string }]>;
+    const body = JSON.parse(String(fetchCalls[0]?.[1]?.body)) as {
       messages: Array<{ role: string; content: string }>;
       format: unknown;
       keep_alive: unknown;
@@ -52,123 +53,33 @@ describe("generateWedgeOllamaDecision", () => {
     expect(body.keep_alive).toBe("0");
   });
 
-  it("normalizes legacy none without repair", async () => {
-    const fetchMock = vi.fn(async () => response(JSON.stringify({ action: "none" })));
-    vi.stubGlobal("fetch", fetchMock);
-
-    const decision = await generateWedgeOllamaDecision({
-      systemPrompt: "system",
-      userText: "起きてる？",
-      fallbackChannelId: "c1",
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(decision).toMatchObject({
-      internal_source: "legacy_normalized",
-      request_level: 0,
-      actions: [{ type: "none" }],
-    });
-  });
-
-  it("normalizes legacy send_message for non-request chatter", async () => {
-    const fetchMock = vi.fn(async () =>
-      response(JSON.stringify({ action: "send_message", content: "ああ、起きてる。" })),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-
-    const decision = await generateWedgeOllamaDecision({
-      systemPrompt: "system",
-      userText: "起きてる？",
-      fallbackChannelId: "c1",
-      fallbackReplyToMessageId: "m1",
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(decision.actions[0]).toMatchObject({
-      type: "discord_send_message",
-      target_channel_id: "c1",
-      reply_to_message_id: "m1",
-      content: "ああ、起きてる。",
-    });
-  });
-
-  it("does not normalize legacy send_message for artifact requests", async () => {
+  it("retries the same decision prompt before repair", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(response(JSON.stringify({ action: "send_message", content: "待っててね。" })))
-      .mockResolvedValueOnce(
-        response(
-          JSON.stringify({
-            thought_summary: "供物を受け取り、依頼を実行する。",
-            interpretation: {
-              user_intent: "供物つきの俳句作成依頼",
-              referents: ["ビーフジャーキー"],
-              actor: "wedge",
-              confidence: 0.9,
-              ambiguity: null,
-            },
-            triage: "continue",
-            request_level: 3,
-            offering: { present: true, accepted: true, name: "ビーフジャーキー", quantity: 1, satisfaction: 6, notes: null },
-            actions: [
-              { type: "nest_stash", name: "ビーフジャーキー", quantity: 1, notes: "俳句の対価。" },
-              { type: "discord_send_message", target_channel_id: "c1", content: "ワシ、詠む。" },
-            ],
-            continue_loop: false,
-          }),
-        ),
-      );
+      .mockResolvedValueOnce(response(JSON.stringify({ action: "unknown_bad" })))
+      .mockResolvedValueOnce(response(validDecision("ワシ、いる。")));
     vi.stubGlobal("fetch", fetchMock);
 
     const decision = await generateWedgeOllamaDecision({
       systemPrompt: "system",
-      userText: "ビーフジャーキーあげる。なんでもいいから俳句を詠んでほしい",
+      userText: "起きてる？",
       fallbackChannelId: "c1",
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { messages: unknown[] };
+    const retryBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as { messages: unknown[] };
+    expect(retryBody.messages).toEqual(firstBody.messages);
     expect(decision.internal_source).toBeUndefined();
-    expect(JSON.stringify(decision)).not.toContain("待っててね");
-  });
-
-  it("normalizes thought and response for non-request chatter", async () => {
-    const fetchMock = vi.fn(async () => response(JSON.stringify({ thought: "返す。", response: "ワシ、いる。" })));
-    vi.stubGlobal("fetch", fetchMock);
-
-    const decision = await generateWedgeOllamaDecision({
-      systemPrompt: "system",
-      userText: "起きてる？",
-      fallbackChannelId: "c1",
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(decision.actions[0]).toMatchObject({ type: "discord_send_message", content: "ワシ、いる。" });
   });
 
-  it("repairs malformed JSON once with isolated repair prompt", async () => {
+  it("repairs malformed JSON with an isolated repair prompt", async () => {
     vi.stubEnv("WEDGE_OLLAMA_FORMAT_RETRIES", "0");
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(response(JSON.stringify({ action: "unknown_bad" })))
-      .mockResolvedValueOnce(
-        response(
-          JSON.stringify({
-            thought_summary: "修復済みの返信を返す。",
-            interpretation: {
-              user_intent: "挨拶",
-              referents: [],
-              actor: "wedge",
-              confidence: 0.5,
-              ambiguity: null,
-            },
-            triage: "continue",
-            request_level: 0,
-            offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-            actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "直した。" }],
-            continue_loop: false,
-          }),
-        ),
-      );
+      .mockResolvedValueOnce(response(validDecision("直した。")));
     vi.stubGlobal("fetch", fetchMock);
 
     const decision = await generateWedgeOllamaDecision({
@@ -187,46 +98,7 @@ describe("generateWedgeOllamaDecision", () => {
     expect(decision.actions[0]).toMatchObject({ type: "discord_send_message", content: "直した。" });
   });
 
-  it("retries the same decision prompt before repair", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(response(JSON.stringify({ action: "unknown_bad" })))
-      .mockResolvedValueOnce(
-        response(
-          JSON.stringify({
-            thought_summary: "再試行で正しいJSONを返す。",
-            interpretation: {
-              user_intent: "挨拶",
-              referents: [],
-              actor: "wedge",
-              confidence: 1,
-              ambiguity: null,
-            },
-            triage: "continue",
-            request_level: 0,
-            offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-            actions: [{ type: "discord_send_message", target_channel_id: "c1", content: "ワシ、いる。" }],
-            continue_loop: false,
-          }),
-        ),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-
-    const decision = await generateWedgeOllamaDecision({
-      systemPrompt: "system",
-      userText: "起きてる？",
-      fallbackChannelId: "c1",
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const firstBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { messages: unknown[] };
-    const retryBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as { messages: unknown[] };
-    expect(retryBody.messages).toEqual(firstBody.messages);
-    expect(decision.internal_source).toBeUndefined();
-    expect(decision.actions[0]).toMatchObject({ type: "discord_send_message", content: "ワシ、いる。" });
-  });
-
-  it("does not treat repair prompt output as a user request", async () => {
+  it("throws when repair output interprets the repair task as a user request", async () => {
     vi.stubEnv("WEDGE_OLLAMA_FORMAT_RETRIES", "0");
     const fetchMock = vi
       .fn()
@@ -252,28 +124,17 @@ describe("generateWedgeOllamaDecision", () => {
       );
     vi.stubGlobal("fetch", fetchMock);
 
-    const decision = await generateWedgeOllamaDecision({
-      systemPrompt: "system",
-      userText: "こんにちは",
-      fallbackChannelId: "c1",
-      fallbackReplyToMessageId: "m1",
-    });
-
-    expect(decision).toMatchObject({
-      internal_source: "fallback",
-      request_level: 0,
-      actions: [
-        {
-          type: "discord_send_message",
-          target_channel_id: "c1",
-          reply_to_message_id: "m1",
-        },
-      ],
-    });
-    expect(JSON.stringify(decision)).not.toContain("くれるモノ");
+    await expect(
+      generateWedgeOllamaDecision({
+        systemPrompt: "system",
+        userText: "こんにちは",
+        fallbackChannelId: "c1",
+        fallbackReplyToMessageId: "m1",
+      }),
+    ).rejects.toThrow("wedge_llm_json_failed");
   });
 
-  it("falls back to a Discord message when repair fails", async () => {
+  it("throws without sending a fallback decision when repair fails", async () => {
     vi.stubEnv("WEDGE_OLLAMA_FORMAT_RETRIES", "0");
     const fetchMock = vi
       .fn()
@@ -281,17 +142,13 @@ describe("generateWedgeOllamaDecision", () => {
       .mockResolvedValueOnce(response(JSON.stringify({ action: "still_bad" })));
     vi.stubGlobal("fetch", fetchMock);
 
-    const decision = await generateWedgeOllamaDecision({
-      systemPrompt: "system",
-      userText: "こんにちは",
-      fallbackChannelId: "c1",
-      fallbackReplyToMessageId: "m1",
-    });
-
-    expect(decision.actions[0]).toMatchObject({
-      type: "discord_send_message",
-      target_channel_id: "c1",
-      reply_to_message_id: "m1",
-    });
+    await expect(
+      generateWedgeOllamaDecision({
+        systemPrompt: "system",
+        userText: "こんにちは",
+        fallbackChannelId: "c1",
+        fallbackReplyToMessageId: "m1",
+      }),
+    ).rejects.toThrow("wedge_llm_json_failed");
   });
 });
