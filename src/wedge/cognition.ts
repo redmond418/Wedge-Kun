@@ -1,12 +1,11 @@
 import { executeWedgeAction, type WedgeActionRuntime } from "./actions.js";
-import type { WedgeDecision } from "./cognition-schema.js";
+import { wedgeDecisionJsonSchemaDescription, type WedgeDecision } from "./cognition-schema.js";
 import { generateWedgeOllamaDecision } from "./ollama.js";
 import { buildWedgeSystemPrompt, type WedgePromptContext } from "./prompt.js";
-import type { WedgeDatabase, WedgeLogInput } from "./storage.js";
+import type { WedgeDatabase, WedgeLogInput, WedgePendingRequest } from "./storage.js";
 
 const MAX_COGNITION_ITERATIONS = 10;
-
-type TriggerIntentKind = "chitchat" | "artifact_request" | "tool_request" | "offering_only" | "ambiguous";
+const MAX_PROTOCOL_RETRIES = 3;
 
 export type WedgeCognitionTrigger = {
   kind: "discord_message" | "local_chat" | "memory_batch" | "soliloquy";
@@ -28,7 +27,7 @@ export async function runWedgeCognitionLoop(params: {
   trigger: WedgeCognitionTrigger;
   runtime?: WedgeActionRuntime;
   maxIterations?: number;
-}): Promise<{ iterations: number; finalTriage: string; actionCount: number }> {
+}): Promise<{ iterations: number; finalTriage: string; actionCount: number; llmCallCount: number }> {
   const maxIterations = params.maxIterations ?? MAX_COGNITION_ITERATIONS;
   const runId = params.db.createCognitionRun({
     triggerMessageId: params.trigger.messageId,
@@ -38,49 +37,59 @@ export async function runWedgeCognitionLoop(params: {
   const toolResults: Array<{ action: string; result: unknown }> = [];
   let finalTriage = "continue";
   let actionCount = 0;
+  let llmCallCount = 0;
+  const pendingRequest = getApplicablePendingRequest(params.db.getConversationState(params.trigger.channelId).pendingRequest, params.trigger);
+
   for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
-    const context: WedgePromptContext = {
-      trigger: {
-        kind: params.trigger.kind,
-        channelId: params.trigger.channelId,
-        channelName: params.trigger.channelName ?? null,
-        guildId: params.trigger.guildId ?? null,
-        messageId: params.trigger.messageId ?? null,
-        userId: params.trigger.userId ?? null,
-        userName: params.trigger.userName ?? null,
-        userIsBot: params.trigger.userIsBot ?? false,
-        text: params.trigger.text,
-        replyToMessageId: params.trigger.replyToMessageId ?? null,
-        replyToUserId: params.trigger.replyToUserId ?? null,
-        attachments: params.trigger.attachments ?? [],
-      },
-      recentLogs: params.db.listRecentLogs(params.trigger.channelId, 8),
-      toolResults,
-      iteration,
-    };
+    const context = buildPromptContext(params.trigger, params.db, toolResults, pendingRequest, iteration);
     const prompt = buildWedgeSystemPrompt({ db: params.db, context });
     const llmDebugEvents: Array<{ phase: string; text?: string; error?: string }> = [];
-    const rawDecision = await generateWedgeOllamaDecision({
-      systemPrompt: prompt,
-      userText: params.trigger.text,
-      fallbackChannelId: params.trigger.channelId,
-      fallbackReplyToMessageId: params.trigger.messageId ?? null,
-      onDebug: (event) => {
-        llmDebugEvents.push(event);
+    let decision: WedgeDecision;
+    try {
+      decision = await generateWedgeOllamaDecision({
+        systemPrompt: prompt,
+        userText: params.trigger.text,
+        fallbackChannelId: params.trigger.channelId,
+        fallbackReplyToMessageId: params.trigger.messageId ?? null,
+        onDebug: (event) => {
+          if (event.phase === "raw_output" || event.phase === "retry_raw_output" || event.phase === "repair_raw_output") {
+            llmCallCount += 1;
+          }
+          llmDebugEvents.push(event);
+        },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      for (const event of llmDebugEvents) {
+        params.db.insertCognitionStep({
+          runId,
+          iteration,
+          prompt,
+          resultJson: JSON.stringify({ llm_debug: event }),
+          error: event.error,
+        });
+      }
+      params.db.insertCognitionStep({ runId, iteration, prompt, error: message });
+      throw err;
+    }
+
+    decision = await resolveProtocolInvalidDecision({
+      db: params.db,
+      runId,
+      iteration,
+      prompt,
+      trigger: params.trigger,
+      decision,
+      toolResults,
+      pendingRequest,
+      llmDebugEvents,
+      onLlmCall: () => {
+        llmCallCount += 1;
       },
     });
-    const triggerIntent = classifyTriggerIntent(params.trigger.text);
-    const semanticResult = applySemanticGuard(normalizeDecision(rawDecision), params.trigger, triggerIntent, toolResults);
-    const { decision, guardResult } = applyOfferingConsistencyGuard(
-      enforceOfferingGate(semanticResult.decision, params.trigger, triggerIntent),
-    );
-    if (semanticResult.guardResult) {
-      toolResults.push({ action: "semantic_guard", result: semanticResult.guardResult });
-    }
-    if (guardResult) {
-      toolResults.push({ action: "offering_consistency_guard", result: guardResult });
-    }
+
     finalTriage = decision.triage;
+    updatePendingRequestState(params.db, params.trigger, decision, pendingRequest);
     for (const event of llmDebugEvents) {
       params.db.insertCognitionStep({
         runId,
@@ -91,44 +100,14 @@ export async function runWedgeCognitionLoop(params: {
       });
     }
     params.db.insertCognitionStep({ runId, iteration, prompt, decision });
-    if (semanticResult.guardResult) {
-      params.db.insertCognitionStep({
-        runId,
-        iteration,
-        prompt,
-        resultJson: JSON.stringify({ semantic_guard: semanticResult.guardResult }),
-      });
-    }
-    if (guardResult) {
-      params.db.insertCognitionStep({
-        runId,
-        iteration,
-        prompt,
-        resultJson: JSON.stringify({ offering_consistency_guard: guardResult }),
-      });
-    }
     console.log(
       `[wedge:cognition] iteration=${iteration} triage=${decision.triage} actions=${decision.actions.length} continue=${decision.continue_loop} thought=${decision.thought_summary}`,
     );
     if (process.env.WEDGE_DEBUG_LLM !== "0") {
       console.log(`[wedge:cognition] decision=${JSON.stringify(decision)}`);
     }
+
     for (const action of decision.actions) {
-      if (
-        decision.continue_loop &&
-        (action.type === "discord_send_message" || action.type === "discord_add_reaction")
-      ) {
-        const result = { skipped: "deferred user-facing action until final iteration" };
-        toolResults.push({ action: action.type, result });
-        params.db.insertCognitionStep({
-          runId,
-          iteration,
-          prompt,
-          action,
-          resultJson: JSON.stringify(result),
-        });
-        continue;
-      }
       try {
         const result = await executeWedgeAction({
           db: params.db,
@@ -138,356 +117,376 @@ export async function runWedgeCognitionLoop(params: {
         });
         actionCount += 1;
         toolResults.push({ action: action.type, result });
-        params.db.insertCognitionStep({
-          runId,
-          iteration,
-          prompt,
-          action,
-          resultJson: JSON.stringify(result),
-        });
+        params.db.insertCognitionStep({ runId, iteration, prompt, action, resultJson: JSON.stringify(result) });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         toolResults.push({ action: action.type, result: { ok: false, error: message } });
         params.db.insertCognitionStep({ runId, iteration, prompt, action, error: message });
       }
     }
+
     if (!decision.continue_loop) {
-      return { iterations: iteration, finalTriage, actionCount };
+      return { iterations: iteration, finalTriage, actionCount, llmCallCount };
     }
   }
+
   params.db.insertLog(createLoopLimitLog(params.trigger));
-  return { iterations: maxIterations, finalTriage, actionCount };
-}
-
-function enforceOfferingGate(
-  decision: WedgeDecision,
-  trigger: WedgeCognitionTrigger,
-  triggerIntent: TriggerIntentKind,
-): WedgeDecision {
-  if (
-    decision.internal_source === "fallback" ||
-    decision.internal_source === "repair" ||
-    (decision.internal_source === "legacy_normalized" && decision.actions.some((action) => action.type === "none"))
-  ) {
-    return decision;
-  }
-  if (triggerIntent !== "artifact_request" && triggerIntent !== "tool_request") {
-    return decision;
-  }
-  const satisfaction = decision.offering.present ? decision.offering.satisfaction : 0;
-  if (decision.request_level <= satisfaction) {
-    return decision;
-  }
-  return {
-    ...decision,
-    thought_summary: "供物不足のため、依頼本文を実行せず催促に差し替える。",
-    triage: "block",
-    offering: {
-      ...decision.offering,
-      accepted: false,
-    },
-    actions: [
-      {
-        type: "discord_send_message",
-        target_channel_id: trigger.channelId,
-        reply_to_message_id: trigger.messageId ?? null,
-        content: "ワシ、ただでは動かん。くれるモノ、何。",
-      },
-    ],
-    continue_loop: false,
-  };
-}
-
-function normalizeDecision(decision: WedgeDecision): WedgeDecision {
-  let normalized = decision;
-  if (
-    normalized.offering.present &&
-    normalized.offering.satisfaction >= normalized.request_level &&
-    !normalized.offering.accepted
-  ) {
-    normalized = {
-      ...normalized,
-      offering: {
-        ...normalized.offering,
-        accepted: true,
-      },
-    };
-  }
-  if (!normalized.actions.some((action) => action.type === "nest_consume")) {
-    const hasWedgeAction = normalized.actions.some(
-      (action) =>
-        action.type !== "none" &&
-        action.type !== "discord_add_reaction" &&
-        action.type !== "discord_send_message",
-    );
-    if (!hasWedgeAction || normalized.interpretation.actor === "wedge") {
-      return normalized;
-    }
-    return {
-      ...normalized,
-      interpretation: {
-        ...normalized.interpretation,
-        actor: "wedge",
-        ambiguity:
-          normalized.interpretation.ambiguity ??
-          "Wedge側の行動 action が選ばれたため、行動主体をウェッジくんとして扱う。",
-      },
-    };
-  }
-  if (normalized.interpretation.actor === "wedge") {
-    return normalized;
-  }
-  return {
-    ...normalized,
-    interpretation: {
-      ...normalized.interpretation,
-      actor: "wedge",
-      ambiguity:
-        normalized.interpretation.ambiguity ??
-        "巣アイテム消費 action が選ばれたため、行動主体をウェッジくんとして扱う。",
-    },
-  };
-}
-
-function applySemanticGuard(
-  decision: WedgeDecision,
-  trigger: WedgeCognitionTrigger,
-  triggerIntent: TriggerIntentKind,
-  toolResults: Array<{ action: string; result: unknown }>,
-): { decision: WedgeDecision; guardResult?: { ok: true; reason: string; intent: TriggerIntentKind } } {
-  let guarded = decision;
-  const reasons: string[] = [];
-  const hasExplicitOffering = hasOfferingCue(trigger.text);
-  const extractedOffering = extractOffering(trigger.text);
-  if (
-    hasExplicitOffering &&
-    extractedOffering &&
-    (!guarded.offering.present ||
-      guarded.offering.name !== extractedOffering ||
-      guarded.offering.satisfaction < guarded.request_level)
-  ) {
-    const satisfaction = Math.max(guarded.offering.satisfaction, Math.max(1, guarded.request_level));
-    guarded = {
-      ...guarded,
-      offering: {
-        present: true,
-        accepted: satisfaction >= guarded.request_level,
-        name: extractedOffering,
-        quantity: 1,
-        satisfaction: Math.min(10, satisfaction),
-        notes: "ユーザー発話から検出した供物。",
-      },
-    };
-    reasons.push("explicit_offering_recovered");
-  }
-  if (!hasExplicitOffering && looksLikeFakeOffering(guarded.offering.name)) {
-    guarded = {
-      ...guarded,
-      offering: { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-    };
-    reasons.push("fake_offering_removed");
-  }
-  if (triggerIntent === "chitchat") {
-    guarded = {
-      ...guarded,
-      triage: guarded.triage === "block" ? "continue" : guarded.triage,
-      request_level: 0,
-      offering: hasExplicitOffering
-        ? guarded.offering
-        : { present: false, accepted: false, name: null, quantity: 0, satisfaction: 0, notes: null },
-    };
-    reasons.push("chitchat_never_requires_offering");
-  }
-  const actions = guarded.actions.filter((action) => !isInvalidNoopAction(action));
-  if (actions.length !== guarded.actions.length) {
-    guarded = { ...guarded, actions };
-    reasons.push("invalid_noop_action_removed");
-  }
-  if (guarded.continue_loop && !guarded.actions.some(isContextExpandingAction)) {
-    guarded = { ...guarded, continue_loop: false };
-    reasons.push("non_expanding_loop_stopped");
-  }
-  const offeringAccepted = guarded.offering.present && guarded.offering.accepted && guarded.offering.name;
-  const alreadyStashed = toolResults.some((result) => result.action === "nest_stash");
-  if (offeringAccepted && !alreadyStashed && !guarded.actions.some((action) => action.type === "nest_stash")) {
-    guarded = {
-      ...guarded,
-      actions: [
-        {
-          type: "nest_stash",
-          name: guarded.offering.name ?? "供物",
-          quantity: Math.max(1, guarded.offering.quantity),
-          notes: guarded.offering.notes,
-        },
-        ...guarded.actions,
-      ],
-      continue_loop: true,
-    };
-    reasons.push("accepted_offering_stash_added");
-  }
-  if (
-    (triggerIntent === "artifact_request" || triggerIntent === "tool_request") &&
-    offeringAccepted &&
-    !alreadyStashed &&
-    guarded.actions.some(isContextExpandingAction) &&
-    guarded.actions.some((action) => action.type === "discord_send_message" && looksLikePromiseOnly(action.content))
-  ) {
-    guarded = { ...guarded, continue_loop: true };
-    reasons.push("promise_only_reply_deferred");
-  }
-  if (triggerIntent === "chitchat" && !guarded.actions.some(isUserFacingAction)) {
-    guarded = {
-      ...guarded,
-      actions: [
-        {
-          type: "discord_send_message",
-          target_channel_id: trigger.channelId,
-          reply_to_message_id: trigger.messageId ?? null,
-          content: "ワシ、聞いてる。ニンゲン、話、続けるか。",
-        },
-      ],
-      continue_loop: false,
-    };
-    reasons.push("chitchat_reply_fallback_added");
-  }
-  if (reasons.length === 0) {
-    return { decision };
-  }
-  return {
-    decision: {
-      ...guarded,
-      thought_summary:
-        triggerIntent === "chitchat"
-          ? "雑談として扱い、供物要求や不要な再思考を抑止する。"
-          : guarded.thought_summary,
-    },
-    guardResult: { ok: true, reason: reasons.join(","), intent: triggerIntent },
-  };
-}
-
-function applyOfferingConsistencyGuard(decision: WedgeDecision): {
-  decision: WedgeDecision;
-  guardResult?: { ok: true; reason: string };
-} {
-  if (!decision.offering.present || decision.offering.satisfaction < decision.request_level) {
-    return { decision };
-  }
-  const asksForMoreOffering = decision.actions.some((action) => {
-    if (action.type !== "discord_send_message") {
-      return false;
-    }
-    return /足りない|くれるモノ|供物|ただでは/.test(action.content);
+  params.db.insertCognitionStep({
+    runId,
+    iteration: maxIterations,
+    prompt: "[loop_limit]",
+    error: "Wedge cognition loop reached iteration limit.",
   });
-  if (!asksForMoreOffering) {
-    return { decision };
-  }
-  return {
-    decision: {
-      ...decision,
-      thought_summary: "供物は足りているため、追加催促を保留して依頼実行のため再思考する。",
-      offering: {
-        ...decision.offering,
-        accepted: true,
+  throw new Error("wedge_cognition_loop_limit");
+}
+
+async function resolveProtocolInvalidDecision(params: {
+  db: WedgeDatabase;
+  runId: number;
+  iteration: number;
+  prompt: string;
+  trigger: WedgeCognitionTrigger;
+  decision: WedgeDecision;
+  toolResults: Array<{ action: string; result: unknown }>;
+  pendingRequest: WedgePendingRequest | null;
+  llmDebugEvents: Array<{ phase: string; text?: string; error?: string }>;
+  onLlmCall: () => void;
+}): Promise<WedgeDecision> {
+  let decision = params.decision;
+  for (let attempt = 1; attempt <= MAX_PROTOCOL_RETRIES; attempt += 1) {
+    const issue = getDecisionProtocolIssue(decision, params.trigger.text, params.pendingRequest, params.toolResults);
+    if (!issue) {
+      return decision;
+    }
+    if (issue === "continue_loop_with_final_user_facing_action") {
+      const finalized = { ...decision, continue_loop: false };
+      params.db.insertCognitionStep({
+        runId: params.runId,
+        iteration: params.iteration,
+        prompt: params.prompt,
+        decision: finalized,
+        resultJson: JSON.stringify({ protocol_structural_fix: issue }),
+      });
+      return finalized;
+    }
+    if (issue === "insufficient_offering_not_blocked" && hasUserFacingAction(decision) && hasOfferingPromptAction(decision)) {
+      const finalized = { ...decision, triage: "block" as const, continue_loop: false };
+      params.db.insertCognitionStep({
+        runId: params.runId,
+        iteration: params.iteration,
+        prompt: params.prompt,
+        decision: finalized,
+        resultJson: JSON.stringify({ protocol_structural_fix: issue }),
+      });
+      return finalized;
+    }
+    params.db.insertCognitionStep({
+      runId: params.runId,
+      iteration: params.iteration,
+      prompt: params.prompt,
+      decision,
+      error: `protocol_invalid:${issue}`,
+    });
+    const correctionDebugEvents: Array<{ phase: string; text?: string; error?: string }> = [];
+    decision = await generateWedgeOllamaDecision({
+      systemPrompt: buildProtocolRedoPrompt({
+        issue,
+        trigger: params.trigger,
+        previousDecision: decision,
+        toolResults: params.toolResults,
+        pendingRequest: params.pendingRequest,
+      }),
+      userText: params.trigger.text,
+      fallbackChannelId: params.trigger.channelId,
+      fallbackReplyToMessageId: params.trigger.messageId ?? null,
+      allowRepair: false,
+      onDebug: (event) => {
+        if (event.phase === "raw_output" || event.phase === "retry_raw_output" || event.phase === "repair_raw_output") {
+          params.onLlmCall();
+        }
+        correctionDebugEvents.push(event);
       },
-      continue_loop: true,
-    },
-    guardResult: {
-      ok: true,
-      reason:
-        "供物満足度が依頼レベル以上なので、追加供物を求めず、受け取った供物を前提に依頼された成果物を実行すること。",
-    },
-  };
+    });
+    for (const event of correctionDebugEvents) {
+      params.llmDebugEvents.push({ ...event, phase: `protocol_${event.phase}` });
+      params.db.insertCognitionStep({
+        runId: params.runId,
+        iteration: params.iteration,
+        prompt: params.prompt,
+        resultJson: JSON.stringify({ llm_debug: { ...event, phase: `protocol_${event.phase}` } }),
+        error: event.error,
+      });
+    }
+    params.db.insertCognitionStep({
+      runId: params.runId,
+      iteration: params.iteration,
+      prompt: params.prompt,
+      decision,
+      resultJson: JSON.stringify({ protocol_correction_attempt: attempt, source: "llm" }),
+    });
+  }
+  const issue = getDecisionProtocolIssue(decision, params.trigger.text, params.pendingRequest, params.toolResults);
+  if (issue === "continue_loop_with_final_user_facing_action") {
+    const finalized = { ...decision, continue_loop: false };
+    params.db.insertCognitionStep({
+      runId: params.runId,
+      iteration: params.iteration,
+      prompt: params.prompt,
+      decision: finalized,
+      resultJson: JSON.stringify({ protocol_structural_fix: issue, after_llm_redo: true }),
+    });
+    return finalized;
+  }
+  if (issue) {
+    params.db.insertCognitionStep({
+      runId: params.runId,
+      iteration: params.iteration,
+      prompt: params.prompt,
+      decision,
+      error: `protocol_invalid_after_retry:${issue}`,
+    });
+    throw new Error(`wedge_llm_protocol_invalid:${issue}`);
+  }
+  return decision;
 }
 
-function classifyTriggerIntent(text: string): TriggerIntentKind {
-  const normalized = text.trim();
-  if (!normalized) {
-    return "ambiguous";
-  }
-  const hasOffering = hasOfferingCue(normalized);
-  const hasArtifact = hasArtifactRequestCue(normalized);
-  const hasTool = hasToolRequestCue(normalized);
-  if (hasTool) {
-    return "tool_request";
-  }
-  if (hasArtifact) {
-    return "artifact_request";
-  }
-  if (hasOffering) {
-    return "offering_only";
-  }
-  if (isChitchat(normalized)) {
-    return "chitchat";
-  }
-  return "ambiguous";
+function buildFinalActionPrompt(basePrompt: string, issue: string): string {
+  return [
+    "[final_action_task]",
+    `前回の判断は ${issue} により最終行動として不完全だった。`,
+    "これは前回出力の修理ではない。同じ context と現在のユーザー発話を読み直し、最終 action を最初から再判断するタスクである。",
+    "user メッセージは通常のユーザー発話として扱う。内部メタ情報は user メッセージに含まれていない。",
+    "会話文、供物判断、頼みごと判断、pending_request の扱いはすべてあなたが context から決める。",
+    "固定文や runtime 補完は存在しない。",
+    "このタスクでは原則 `continue_loop=false` にする。",
+    "ユーザーに返すべき会話なら、あなたが生成した `discord_send_message` を actions に含める。",
+    "artifact_reply_promise_only の場合は、予告や受諾だけで終わらせず、依頼された成果物本文または実行結果そのものを `content` に含める。",
+    "insufficient_offering_not_blocked の場合は、成果物本文を出さず、あなたの言葉で供物や対価を求める。",
+    "accepted_offering_without_nest_stash の場合は、受け取る供物を `nest_stash` し、同じ actions に最終返信も含める。",
+    "unauthorized_nest_consume の場合は、巣の中身を勝手に使わず、現在発話と pending_request だけを見て最終行動を決める。",
+    "供物や記憶などの state 更新が必要なら、その action と最終 `discord_send_message` を同じ actions に含める。",
+    "`none` は、本当に何もしないのが最終行動として自然な場合だけ使う。",
+    "tool_results があるなら、その結果を読んでユーザー向けに説明する。再度同じ文脈取得 tool を呼ばない。",
+    "JSON オブジェクトだけを返す。",
+    "",
+    basePrompt,
+  ].join("\n");
 }
 
-function hasOfferingCue(text: string): boolean {
-  return /あげる|あげた|渡す|渡した|供物|差し入れ|プレゼント|贈る|受け取って|もらって|どうぞ|食べていい|使っていい/.test(
-    text,
-  );
+function buildProtocolRedoPrompt(params: {
+  issue: string;
+  trigger: WedgeCognitionTrigger;
+  previousDecision: WedgeDecision;
+  toolResults: Array<{ action: string; result: unknown }>;
+  pendingRequest: WedgePendingRequest | null;
+}): string {
+  return [
+    "[protocol_redo_task]",
+    "あなたはウェッジくんの最終行動 JSON を作り直す。これは通常会話ではなく、直前の WedgeDecision が不完全だったための短い再判断タスク。",
+    "固定文や runtime 補完は存在しない。会話文、供物判定、頼みごと判定、最終 action はあなたが生成する。",
+    "出力は WedgeDecision JSON オブジェクトだけ。Markdown と説明文は禁止。",
+    "",
+    "[persona_min]",
+    "ウェッジくん。一人称はワシ、二人称はニンゲン。助詞少なめの短いカタコト。ただし成果物や説明は意味が伝わる長さにする。",
+    "",
+    "[issue]",
+    params.issue,
+    "",
+    "[issue_rules]",
+    "- artifact_reply_promise_only: 予告や受諾だけで終わらせず、依頼された成果物本文または実行結果そのものを discord_send_message.content に含める。pending_request がある場合は、それが今実行すべき依頼本文である。",
+    "- insufficient_offering_not_blocked: 成果物本文を出さず、あなたの言葉で供物や対価を求め、triage を block にする。",
+    "- accepted_offering_without_nest_stash: 受け取る供物を nest_stash し、同じ actions に最終返信も含める。",
+    "- unauthorized_nest_consume: 巣の中身を勝手に使わず、現在発話だけを見て最終行動を決める。",
+    "- data_fetch_with_final_user_facing_action: 文脈取得 tool の結果を読まずに返信している。必要なら文脈取得 tool だけを出して continue_loop=true、不要なら tool を外して最終返信する。",
+    "- repeated_data_fetch_after_result: tool_results に既に結果がある。同じ tool を再実行せず、その結果を読んで最終返信を書く。",
+    "- artifact_placeholder_content: プレースホルダや「ここに本文」ではなく、実際の成果物本文を書く。",
+    "- pending_request_not_fulfilled_after_offering: pending_request が現在実行対象。供物を受け取るだけで終わらせず、pending_request の成果物本文または実行結果を同じ最終返信に含める。",
+    "- unsupported_external_lookup_with_offering_prompt: 外部情報 tool が未実装なら、捏造せず取得手段がないことだけを説明する。供物や対価を求めてはいけない。",
+    "- unprompted_offering_prompt_for_low_request: あなた自身の判断で軽い雑談や感謝なら、供物や対価を要求せず自然に返す。",
+    "- continue_loop_without_context_action: 返すべき会話があるなら discord_send_message を出し、continue_loop=false にする。",
+    "- 前回の discord_send_message.content は無効判定された本文なのでコピーしない。必要な場合は、文脈を読み直して新しい本文を書く。",
+    "",
+    "[current_user_text]",
+    params.trigger.text,
+    "",
+    "[trigger]",
+    JSON.stringify(params.trigger, null, 2),
+    "",
+    "[pending_request]",
+    JSON.stringify(params.pendingRequest, null, 2),
+    "",
+    "[previous_decision]",
+    JSON.stringify(params.previousDecision, null, 2),
+    "",
+    "[invalid_previous_user_facing_content]",
+    collectUserFacingText(params.previousDecision) || null,
+    "",
+    "[tool_results]",
+    JSON.stringify(params.toolResults.slice(-3), null, 2),
+    "",
+    "[schema]",
+    wedgeDecisionJsonSchemaDescription(),
+  ].join("\n");
 }
 
-function extractOffering(text: string): string | null {
-  const match =
-    /(?:これ、?|この)?\s*([^。！？\n]{1,32}?)(?:を)?(?:あげる|渡す|差し入れ|プレゼント|贈る|受け取って|もらって|どうぞ)/.exec(
-      text,
-    ) ?? /([^。！？\n]{1,32}?)(?:を)?(?:あげた|渡した)/.exec(text);
-  const item = match?.[1]?.trim().replace(/[、，\s]+$/g, "");
-  if (!item || /^(これ|それ|あれ|何か|なんか)$/.test(item)) {
+function getDecisionProtocolIssue(
+  decision: WedgeDecision,
+  currentText: string,
+  pendingRequest: WedgePendingRequest | null,
+  toolResults: Array<{ action: string; result: unknown }>,
+): string | null {
+  if (isUnauthorizedNestConsume(decision, currentText)) {
+    return "unauthorized_nest_consume";
+  }
+  if (isAcceptedOfferingWithoutStash(decision)) {
+    return "accepted_offering_without_nest_stash";
+  }
+  if (isInsufficientOfferingDecision(decision)) {
+    return "insufficient_offering_not_blocked";
+  }
+  if (isArtifactPromiseOnlyDecision(decision)) {
+    return "artifact_reply_promise_only";
+  }
+  if (hasArtifactPlaceholderContent(decision)) {
+    return "artifact_placeholder_content";
+  }
+  if (isPendingRequestNotFulfilledAfterOffering(decision, pendingRequest)) {
+    return "pending_request_not_fulfilled_after_offering";
+  }
+  if (isUnsupportedExternalLookupWithOfferingPrompt(decision, currentText)) {
+    return "unsupported_external_lookup_with_offering_prompt";
+  }
+  if (isUnpromptedOfferingPromptForLowRequest(decision)) {
+    return "unprompted_offering_prompt_for_low_request";
+  }
+  if (
+    !decision.continue_loop &&
+    decision.actions.some((action) => isUserFacingAction(action)) &&
+    decision.actions.some((action) => isDataFetchingAction(action))
+  ) {
+    return "data_fetch_with_final_user_facing_action";
+  }
+  if (!decision.continue_loop) {
     return null;
   }
-  return item;
+  if (isRepeatedDataFetchAfterResult(decision, toolResults)) {
+    return "repeated_data_fetch_after_result";
+  }
+  if (decision.actions.some((action) => isUserFacingAction(action))) {
+    return decision.actions.some((action) => isDataFetchingAction(action))
+      ? "continue_loop_with_user_facing_and_data_fetch_action"
+      : "continue_loop_with_final_user_facing_action";
+  }
+  if (!decision.actions.some((action) => isContextAddingAction(action))) {
+    return "continue_loop_without_context_action";
+  }
+  return null;
 }
 
-function hasArtifactRequestCue(text: string): boolean {
-  return /してほしい|して欲しい|してくれる|してくれ|話して|語って|詠んで|書いて|作って|描いて|考えて|決めて|調べて|探して|まとめて|説明して|教えて|判断して|観察して|呼び名|あだ名|コード|実装|修正|編集/.test(
-    text,
-  );
-}
-
-function hasToolRequestCue(text: string): boolean {
-  return /ファイル|フォルダ|ディレクトリ|保存|削除|実行|コマンド|ターミナル|画像|アイコン|ログ|DB|sqlite|SQLite|検索/.test(
-    text,
-  );
-}
-
-function isChitchat(text: string): boolean {
-  if (hasArtifactRequestCue(text) || hasToolRequestCue(text)) {
+function isInsufficientOfferingDecision(decision: WedgeDecision): boolean {
+  if (decision.actions.some((action) => action.type === "nest_stash")) {
     return false;
   }
-  if (/おはよう|こんにちは|こんばんは|やあ|調子|元気|大丈夫|起きてる|眠い|天気|いい感じ|わくわく|ありがとう|ごめん|ただいま|おやすみ/.test(text)) {
-    return true;
-  }
-  return text.length <= 18 && /[？?]$/.test(text);
-}
-
-function looksLikeFakeOffering(name: string | null): boolean {
-  if (!name) {
-    return false;
-  }
-  return /conversation|continuation|response|reply|acknowledg|redirection|core_topic|greeting|small.?talk|確認|会話|返答|応答|挨拶|雑談/.test(
-    name,
+  return (
+    decision.triage !== "block" &&
+    decision.request_level >= 4 &&
+    decision.offering.satisfaction < decision.request_level
   );
 }
 
-function isInvalidNoopAction(action: WedgeDecision["actions"][number]): boolean {
-  if (action.type === "none") {
+function isAcceptedOfferingWithoutStash(decision: WedgeDecision): boolean {
+  return (
+    decision.triage !== "block" &&
+    decision.request_level >= 3 &&
+    decision.offering.present &&
+    !decision.actions.some((action) => action.type === "nest_stash")
+  );
+}
+
+function isUnauthorizedNestConsume(decision: WedgeDecision, currentText: string): boolean {
+  if (!decision.actions.some((action) => action.type === "nest_consume")) {
+    return false;
+  }
+  return !/食べ|食う|使|消費|減ら|今.*いい|食べていい|使っていい/.test(currentText);
+}
+
+function hasUserFacingAction(decision: WedgeDecision): boolean {
+  return decision.actions.some((action) => isUserFacingAction(action));
+}
+
+function hasOfferingPromptAction(decision: WedgeDecision): boolean {
+  return /くれるモノ|供物|ただでは|対価/.test(collectUserFacingText(decision));
+}
+
+function collectUserFacingText(decision: WedgeDecision): string {
+  return decision.actions
+    .filter((action): action is Extract<WedgeDecision["actions"][number], { type: "discord_send_message" }> => action.type === "discord_send_message")
+    .map((action) => action.content)
+    .join("\n")
+    .trim();
+}
+
+function isUnpromptedOfferingPromptForLowRequest(decision: WedgeDecision): boolean {
+  if (decision.triage === "block" || decision.request_level > 1 || decision.offering.present) {
+    return false;
+  }
+  return hasOfferingPromptAction(decision);
+}
+
+function hasArtifactPlaceholderContent(decision: WedgeDecision): boolean {
+  return /ここに挿入|本文をここ|物語本文|placeholder/i.test(collectUserFacingText(decision));
+}
+
+function isPendingRequestNotFulfilledAfterOffering(decision: WedgeDecision, pendingRequest: WedgePendingRequest | null): boolean {
+  if (!pendingRequest || decision.triage === "block") {
+    return false;
+  }
+  if (!decision.actions.some((action) => action.type === "nest_stash")) {
+    return false;
+  }
+  const text = collectUserFacingText(decision);
+  if (!text) {
     return true;
   }
-  if (action.type === "update_user_profile") {
-    const userId = action.user_id.trim().toLowerCase();
-    const hasPayload = Boolean(action.call_sign?.trim() || action.details?.trim());
-    return !hasPayload || userId === "n/a" || userId === "unknown" || userId === "null";
+  if (/昔話|物語|話して/.test(pendingRequest.text)) {
+    return text.length < 120 || /しまっとく|受け取|貰う/.test(text);
+  }
+  if (/俳句|詩|作/.test(pendingRequest.text)) {
+    return !text.includes("\n") || /しまっとく|受け取|貰う/.test(text);
   }
   return false;
 }
 
-function isUserFacingAction(action: WedgeDecision["actions"][number]): boolean {
-  return action.type === "discord_send_message" || action.type === "discord_add_reaction";
+function isUnsupportedExternalLookupWithOfferingPrompt(decision: WedgeDecision, currentText: string): boolean {
+  if (!/天気|気温|ニュース|現在|最新|リアルタイム/.test(currentText)) {
+    return false;
+  }
+  return hasOfferingPromptAction(decision);
 }
 
-function isContextExpandingAction(action: WedgeDecision["actions"][number]): boolean {
+function isRepeatedDataFetchAfterResult(
+  decision: WedgeDecision,
+  toolResults: Array<{ action: string; result: unknown }>,
+): boolean {
+  const fetched = new Set(toolResults.map((toolResult) => toolResult.action));
+  return decision.actions.some((action) => isDataFetchingAction(action) && fetched.has(action.type));
+}
+
+function isArtifactPromiseOnlyDecision(decision: WedgeDecision): boolean {
+  if (decision.triage === "block" || decision.request_level < 3) {
+    return false;
+  }
+  const text = collectUserFacingText(decision);
+  if (!text) {
+    return false;
+  }
+  if (text.length >= 120 || text.includes("\n")) {
+    return false;
+  }
+  return /待って|待て|詠む|話す|作ってやる|やってみる|楽しみに|楽しませてやる|準備|聞かせてやる|詠んでやる|話してやる|聞かせろ|期待して|ワシの番|持っとるもん.*出す|聞け/.test(text);
+}
+
+function isContextAddingAction(action: WedgeDecision["actions"][number]): boolean {
   return (
     action.type === "nest_look" ||
     action.type === "nest_stash" ||
@@ -497,11 +496,97 @@ function isContextExpandingAction(action: WedgeDecision["actions"][number]): boo
   );
 }
 
-function looksLikePromiseOnly(content: string): boolean {
-  if (content.length > 120 || content.includes("\n")) {
-    return false;
+function isDataFetchingAction(action: WedgeDecision["actions"][number]): boolean {
+  return (
+    action.type === "nest_look" ||
+    action.type === "fetch_user_recent_logs" ||
+    action.type === "fetch_user_avatar_context"
+  );
+}
+
+function buildPromptContext(
+  trigger: WedgeCognitionTrigger,
+  db: WedgeDatabase,
+  toolResults: Array<{ action: string; result: unknown }>,
+  pendingRequest: WedgePendingRequest | null,
+  iteration: number,
+): WedgePromptContext {
+  return {
+    trigger: {
+      kind: trigger.kind,
+      channelId: trigger.channelId,
+      channelName: trigger.channelName ?? null,
+      guildId: trigger.guildId ?? null,
+      messageId: trigger.messageId ?? null,
+      userId: trigger.userId ?? null,
+      userName: trigger.userName ?? null,
+      userIsBot: trigger.userIsBot ?? false,
+      text: trigger.text,
+      replyToMessageId: trigger.replyToMessageId ?? null,
+      replyToUserId: trigger.replyToUserId ?? null,
+      attachments: trigger.attachments ?? [],
+    },
+    recentLogs: db.listRecentLogs(trigger.channelId, 8),
+    toolResults,
+    pendingRequest,
+    iteration,
+  };
+}
+
+function updatePendingRequestState(
+  db: WedgeDatabase,
+  trigger: WedgeCognitionTrigger,
+  decision: WedgeDecision,
+  pendingRequest: WedgePendingRequest | null,
+) {
+  if (shouldStorePendingRequest(decision)) {
+    db.setConversationState(trigger.channelId, {
+      pendingRequest: {
+        text: trigger.text,
+        userId: trigger.userId ?? null,
+        userName: trigger.userName ?? null,
+        messageId: trigger.messageId ?? null,
+        requestLevel: Math.max(1, decision.request_level),
+        createdAt: Date.now(),
+      },
+    });
+    return;
   }
-  return /詠む|話す|作る|説明する|やる|始める|楽しませ|待て|待って|準備|受け取った|貰った/.test(content);
+  if (pendingRequest) {
+    db.setConversationState(trigger.channelId, { pendingRequest: null });
+  }
+}
+
+function shouldStorePendingRequest(decision: WedgeDecision): boolean {
+  if (decision.triage === "block") {
+    return true;
+  }
+  return (
+    decision.request_level >= 4 &&
+    !decision.offering.accepted &&
+    decision.offering.satisfaction < decision.request_level
+  );
+}
+
+function getApplicablePendingRequest(
+  pendingRequest: WedgePendingRequest | undefined,
+  trigger: WedgeCognitionTrigger,
+): WedgePendingRequest | null {
+  if (!pendingRequest) {
+    return null;
+  }
+  if (pendingRequest.userId && trigger.userId && pendingRequest.userId !== trigger.userId) {
+    return null;
+  }
+  const ageMs = Date.now() - pendingRequest.createdAt;
+  if (pendingRequest.createdAt > 0 && ageMs > 30 * 60 * 1000) {
+    return null;
+  }
+  return pendingRequest;
+}
+
+function isUserFacingAction(action: WedgeDecision["actions"][number]): boolean {
+  return action.type === "discord_send_message" || action.type === "discord_add_reaction";
 }
 
 function createLoopLimitLog(trigger: WedgeCognitionTrigger): WedgeLogInput {

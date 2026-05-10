@@ -89,6 +89,15 @@ export type WedgeConversationState = {
   sleepUntil?: number;
   offeringSeenAt?: number;
   boredUntil?: number;
+  pendingRequest?: WedgePendingRequest;
+};
+export type WedgePendingRequest = {
+  text: string;
+  userId?: string | null;
+  userName?: string | null;
+  messageId?: string | null;
+  requestLevel: number;
+  createdAt: number;
 };
 export type WedgeRegistryEntry = {
   id: string;
@@ -129,6 +138,7 @@ export type WedgeDatabase = {
       lastUserId?: string | null;
       offeringSeenAt?: number | null;
       boredUntil?: number | null;
+      pendingRequest?: WedgePendingRequest | null;
     },
   ): void;
   getConversationState(channelId: string): WedgeConversationState;
@@ -276,14 +286,17 @@ export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabas
         lastUserId?: string | null;
         offeringSeenAt?: number | null;
         boredUntil?: number | null;
+        pendingRequest?: WedgePendingRequest | null;
       },
     ) {
       const current = this.getConversationState(channelId);
+      const pendingRequest =
+        patch.pendingRequest === undefined ? (current.pendingRequest ?? null) : patch.pendingRequest;
       db.prepare(
         `INSERT INTO conversation_state
-          (channel_id, thinking, turn_count, last_topic, last_user_id, last_message_at, sleep_until, offering_seen_at, bored_until)
+          (channel_id, thinking, turn_count, last_topic, last_user_id, last_message_at, sleep_until, offering_seen_at, bored_until, pending_request_json)
          VALUES
-          (@channelId, @thinking, @turnCount, @lastTopic, @lastUserId, unixepoch(), @sleepUntil, @offeringSeenAt, @boredUntil)
+          (@channelId, @thinking, @turnCount, @lastTopic, @lastUserId, unixepoch(), @sleepUntil, @offeringSeenAt, @boredUntil, @pendingRequestJson)
          ON CONFLICT(channel_id) DO UPDATE SET
            thinking = excluded.thinking,
            turn_count = excluded.turn_count,
@@ -292,7 +305,8 @@ export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabas
            last_message_at = excluded.last_message_at,
            sleep_until = excluded.sleep_until,
            offering_seen_at = excluded.offering_seen_at,
-           bored_until = excluded.bored_until`,
+           bored_until = excluded.bored_until,
+           pending_request_json = excluded.pending_request_json`,
       ).run({
         channelId,
         thinking: (patch.thinking ?? current.thinking) ? 1 : 0,
@@ -303,6 +317,7 @@ export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabas
         offeringSeenAt:
           patch.offeringSeenAt === undefined ? (current.offeringSeenAt ?? null) : patch.offeringSeenAt,
         boredUntil: patch.boredUntil === undefined ? (current.boredUntil ?? null) : patch.boredUntil,
+        pendingRequestJson: pendingRequest ? JSON.stringify(pendingRequest) : null,
       });
     },
     getConversationState(channelId: string) {
@@ -315,7 +330,8 @@ export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabas
                   last_message_at AS lastMessageAt,
                   sleep_until AS sleepUntil,
                   offering_seen_at AS offeringSeenAt,
-                  bored_until AS boredUntil
+                  bored_until AS boredUntil,
+                  pending_request_json AS pendingRequestJson
            FROM conversation_state WHERE channel_id = ?`,
         )
         .get(channelId) as
@@ -328,8 +344,10 @@ export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabas
             sleepUntil: number | null;
             offeringSeenAt: number | null;
             boredUntil: number | null;
+            pendingRequestJson: string | null;
           }
         | undefined;
+      const pendingRequest = parsePendingRequest(row?.pendingRequestJson ?? null);
       return {
         thinking: row?.thinking === 1,
         turnCount: row?.turnCount ?? 0,
@@ -339,6 +357,7 @@ export function openWedgeDatabase(dbPath = getWedgeDatabasePath()): WedgeDatabas
         sleepUntil: row?.sleepUntil ?? undefined,
         offeringSeenAt: row?.offeringSeenAt ?? undefined,
         boredUntil: row?.boredUntil ?? undefined,
+        pendingRequest: pendingRequest ?? undefined,
       };
     },
     resetConversation(channelId?: string) {
@@ -642,7 +661,8 @@ function initializeWedgeSchema(db: SqliteConnection) {
       last_message_at INTEGER,
       sleep_until INTEGER,
       offering_seen_at INTEGER,
-      bored_until INTEGER
+      bored_until INTEGER,
+      pending_request_json TEXT
     );
     CREATE TABLE IF NOT EXISTS memory_batch_runs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -682,10 +702,33 @@ function initializeWedgeSchema(db: SqliteConnection) {
   addColumnIfMissing(db, "conversation_state", "last_user_id", "TEXT");
   addColumnIfMissing(db, "conversation_state", "offering_seen_at", "INTEGER");
   addColumnIfMissing(db, "conversation_state", "bored_until", "INTEGER");
+  addColumnIfMissing(db, "conversation_state", "pending_request_json", "TEXT");
   addColumnIfMissing(db, "nest_items", "id", "INTEGER");
   addColumnIfMissing(db, "nest_items", "notes", "TEXT");
   addColumnIfMissing(db, "nest_items", "created_at", "INTEGER");
   addColumnIfMissing(db, "nest_items", "updated_at", "INTEGER");
+}
+
+function parsePendingRequest(value: string | null): WedgePendingRequest | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as Partial<WedgePendingRequest>;
+    if (!parsed.text || typeof parsed.text !== "string") {
+      return null;
+    }
+    return {
+      text: parsed.text,
+      userId: parsed.userId ?? null,
+      userName: parsed.userName ?? null,
+      messageId: parsed.messageId ?? null,
+      requestLevel: Number.isFinite(parsed.requestLevel) ? Number(parsed.requestLevel) : 1,
+      createdAt: Number.isFinite(parsed.createdAt) ? Number(parsed.createdAt) : 0,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function addColumnIfMissing(db: SqliteConnection, table: string, column: string, definition: string) {

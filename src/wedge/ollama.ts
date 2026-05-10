@@ -32,11 +32,9 @@ export type WedgeLlmDebugEvent = {
   phase:
     | "raw_output"
     | "retry_raw_output"
-    | "legacy_normalized"
     | "schema_parse_failed"
     | "repair_raw_output"
-    | "repair_failed"
-    | "fallback_sent";
+    | "repair_failed";
   text?: string;
   error?: string;
 };
@@ -49,6 +47,7 @@ export async function generateWedgeOllamaDecision(params: {
   timeoutMs?: number;
   fallbackChannelId?: string;
   fallbackReplyToMessageId?: string | null;
+  allowRepair?: boolean;
   onDebug?: (event: WedgeLlmDebugEvent) => void;
 }): Promise<WedgeDecision> {
   const defaults = {
@@ -60,9 +59,6 @@ export async function generateWedgeOllamaDecision(params: {
   params.onDebug?.({ phase: "raw_output", text: first.text });
   let parsed = parseDecision(first.text, defaults);
   if (parsed.ok) {
-    if (parsed.decision.internal_source === "legacy_normalized") {
-      params.onDebug?.({ phase: "legacy_normalized", text: first.text });
-    }
     return parsed.decision;
   }
 
@@ -76,15 +72,15 @@ export async function generateWedgeOllamaDecision(params: {
     failedOutputs.push(retry.text);
     parsed = parseDecision(retry.text, defaults);
     if (parsed.ok) {
-      if (parsed.decision.internal_source === "legacy_normalized") {
-        params.onDebug?.({ phase: "legacy_normalized", text: retry.text });
-      }
       return parsed.decision;
     }
   }
 
   params.onDebug?.({ phase: "schema_parse_failed", error: parsed.error, text: first.text });
   console.warn(`[wedge:llm] schema parse failed: ${truncate(parsed.error, 600)}`);
+  if (params.allowRepair === false) {
+    throw new Error(`wedge_llm_json_failed: ${parsed.error}`);
+  }
   const repaired = await callOllama({
     model: params.model,
     baseUrl: params.baseUrl,
@@ -123,12 +119,7 @@ export async function generateWedgeOllamaDecision(params: {
     : reparsed.error;
   params.onDebug?.({ phase: "repair_failed", error: repairError, text: repaired.text });
   console.warn(`[wedge:llm] repair failed: ${truncate(repairError, 600)}`);
-  params.onDebug?.({ phase: "fallback_sent", error: repairError });
-  return fallbackDecision({
-    reason: `json_parse_failed: ${repairError}`,
-    channelId: params.fallbackChannelId,
-    replyToMessageId: params.fallbackReplyToMessageId,
-  });
+  throw new Error(`wedge_llm_json_failed: ${repairError}`);
 }
 
 export async function generateWedgeOllamaReply(params: {
@@ -197,10 +188,6 @@ function normalizeDecisionCandidate(candidate: unknown, defaults: ParseDefaults)
   if (!isRecord(candidate)) {
     return candidate;
   }
-  const legacy = legacyDecisionCandidate(candidate, defaults);
-  if (legacy) {
-    return legacy;
-  }
   const root: Record<string, unknown> = { ...candidate };
   if (typeof root.continue_loop !== "boolean") {
     root.continue_loop = false;
@@ -209,82 +196,6 @@ function normalizeDecisionCandidate(candidate: unknown, defaults: ParseDefaults)
     root.actions = root.actions.map((action) => normalizeActionCandidate(action, defaults));
   }
   return root;
-}
-
-function legacyDecisionCandidate(candidate: Record<string, unknown>, defaults: ParseDefaults): WedgeDecision | null {
-  const action = stringValue(candidate.action);
-  const content =
-    stringValue(candidate.content) ??
-    stringValue(candidate.reply) ??
-    stringValue(candidate.response) ??
-    stringValue(candidate.output);
-  const thought = stringValue(candidate.thought) ?? stringValue(candidate.thought_summary);
-  const source = "legacy_normalized" as const;
-  if (action === "none") {
-    return {
-      ...baseDecision(defaults, "簡易JSONをnone actionとして正規化する。", source),
-      actions: [{ type: "none", reason: "legacy action none" }],
-    };
-  }
-  if (content && estimateRequestLevel(defaults.userText ?? "") > 0) {
-    return null;
-  }
-  if ((action === "send_message" || action === "reply") && content) {
-    return legacyMessageDecision(defaults, content, thought, source);
-  }
-  if (content && (thought || stringValue(candidate.response) || stringValue(candidate.output))) {
-    return legacyMessageDecision(defaults, content, thought, source);
-  }
-  return null;
-}
-
-function legacyMessageDecision(
-  defaults: ParseDefaults,
-  content: string,
-  thought: string | undefined,
-  source: "legacy_normalized",
-): WedgeDecision {
-  return {
-    ...baseDecision(defaults, thought ?? "簡易JSONの返信本文をDiscord送信として正規化する。", source),
-    actions: [
-      {
-        type: "discord_send_message",
-        target_channel_id: defaults.channelId ?? "unknown",
-        reply_to_message_id: defaults.replyToMessageId ?? null,
-        content,
-      },
-    ],
-  };
-}
-
-function baseDecision(
-  defaults: ParseDefaults,
-  thoughtSummary: string,
-  source: "legacy_normalized" | "fallback",
-): WedgeDecision {
-  return {
-    thought_summary: thoughtSummary,
-    interpretation: {
-      user_intent: defaults.userText ?? "判定不能",
-      referents: [],
-      actor: "wedge",
-      confidence: 0.5,
-      ambiguity: null,
-    },
-    triage: "continue",
-    request_level: 0,
-    offering: {
-      present: false,
-      accepted: false,
-      name: null,
-      quantity: 0,
-      satisfaction: 0,
-      notes: null,
-    },
-    actions: [],
-    continue_loop: false,
-    internal_source: source,
-  };
 }
 
 function normalizeActionCandidate(action: unknown, defaults: ParseDefaults): unknown {
@@ -300,12 +211,27 @@ function normalizeActionCandidate(action: unknown, defaults: ParseDefaults): unk
     normalized.content = content;
   }
   normalized.target_channel_id =
-    stringValue(normalized.target_channel_id) ?? defaults.channelId ?? "unknown";
+    normalizeChannelId(stringValue(normalized.target_channel_id), defaults.channelId);
   normalized.reply_to_message_id =
     stringValue(normalized.reply_to_message_id) ?? defaults.replyToMessageId ?? null;
   delete normalized.target_message;
   delete normalized.target_message_context;
   return normalized;
+}
+
+function normalizeChannelId(value: string | undefined, fallback: string | undefined): string {
+  const trimmed = value?.trim();
+  if (
+    !trimmed ||
+    trimmed === "N/A" ||
+    trimmed === "unknown" ||
+    trimmed === "channel_id" ||
+    trimmed === "channel_id_placeholder" ||
+    trimmed === "..."
+  ) {
+    return fallback ?? "unknown";
+  }
+  return trimmed;
 }
 
 function isRepairMetaDecision(decision: WedgeDecision): boolean {
@@ -330,43 +256,6 @@ function hasUnsafeRepairedUserMessage(decision: WedgeDecision): boolean {
     const japanese = action.content.match(/[\u3040-\u30ff\u3400-\u9fff]/g)?.length ?? 0;
     return asciiLetters > 20 && asciiLetters > japanese;
   });
-}
-
-function fallbackDecision(params: {
-  reason: string;
-  channelId?: string;
-  replyToMessageId?: string | null;
-}): WedgeDecision {
-  const channelId = params.channelId ?? "unknown";
-  return {
-    ...baseDecision(
-      { channelId, replyToMessageId: params.replyToMessageId, userText: "形式崩れにより判定不能" },
-      "LLM出力の形式修復に失敗したため、安全な短文で返信する。",
-      "fallback",
-    ),
-    interpretation: {
-      user_intent: "形式崩れにより判定不能",
-      referents: [],
-      actor: "unclear",
-      confidence: 0,
-      ambiguity: params.reason,
-    },
-    actions: [
-      {
-        type: "discord_send_message",
-        target_channel_id: channelId,
-        reply_to_message_id: params.replyToMessageId ?? null,
-        content: "ワシ、言葉、形、崩れた。もう一回、言え。",
-      },
-    ],
-  };
-}
-
-function estimateRequestLevel(text: string): number {
-  if (/話して|詠んで|作って|調べて|判断して|説明して|見て|書いて|生成して|お願い|してほしい/.test(text)) {
-    return 3;
-  }
-  return 0;
 }
 
 async function callOllama(params: {
@@ -406,6 +295,7 @@ async function callOllama(params: {
           { role: "user", content: params.userText },
         ],
         options: {
+          num_ctx: Number.parseInt(process.env.WEDGE_OLLAMA_NUM_CTX ?? "8192", 10),
           num_predict: 1024,
           temperature: 0.4,
         },

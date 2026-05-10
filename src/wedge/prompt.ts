@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { wedgeDecisionJsonSchemaDescription } from "./cognition-schema.js";
-import type { WedgeDatabase, WedgeShortTermLog } from "./storage.js";
+import type { WedgeDatabase, WedgePendingRequest, WedgeShortTermLog } from "./storage.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const promptDirs = [
@@ -28,6 +28,7 @@ export type WedgePromptContext = {
   now?: Date;
   recentLogs?: WedgeShortTermLog[];
   toolResults?: Array<{ action: string; result: unknown }>;
+  pendingRequest?: WedgePendingRequest | null;
   iteration: number;
 };
 
@@ -43,13 +44,14 @@ export function buildWedgeSystemPrompt(params: {
     now: (params.context.now ?? new Date()).toISOString(),
     iteration: params.context.iteration,
     trigger: params.context.trigger,
+    pending_request: params.context.pendingRequest ?? null,
     conversation_focus: buildConversationFocus(params.context.trigger, recentLogs),
     salient_facts: buildSalientFacts(recentLogs, nestItems),
-    short_term_logs: recentLogs.slice(-4).map(formatShortTermLog),
-    core_memory: truncateForPrompt(params.db.getCoreMemoryText(), 1200) || null,
+    short_term_logs: recentLogs.slice(-3).map(formatShortTermLog),
+    core_memory: truncateForPrompt(params.db.getCoreMemoryText(), 800) || null,
     registry: params.db.listRegistry(8),
     nest_items: nestItems,
-    tool_results: (params.context.toolResults ?? []).slice(-4),
+    tool_results: (params.context.toolResults ?? []).slice(-3),
   };
   return [
     "[persona]",
@@ -70,67 +72,17 @@ export function buildWedgeSystemPrompt(params: {
 }
 
 function formatAvailableActions(): string {
-  return JSON.stringify(
-    [
-      {
-        type: "discord_send_message",
-        purpose: "返信、催促、確認、成果物、結果報告をチャンネルへ送る。",
-        required: ["target_channel_id", "content"],
-      },
-      {
-        type: "discord_add_reaction",
-        purpose: "返信文が不要な短い反応。",
-        required: ["target_channel_id", "target_message_id", "emoji"],
-      },
-      {
-        type: "nest_stash",
-        purpose: "供物や取得物を巣に保存する。",
-        required: ["name", "quantity"],
-      },
-      {
-        type: "nest_consume",
-        purpose: "巣のアイテムを食べる、使う、消費する。",
-        required: ["item_id or name", "quantity", "reason"],
-      },
-      {
-        type: "nest_update",
-        purpose: "巣アイテムの事務的な修正。消費には使わない。",
-        required: ["item_id or name"],
-      },
-      {
-        type: "nest_look",
-        purpose: "巣の中身確認、参照先確認。",
-        required: [],
-      },
-      {
-        type: "update_user_profile",
-        purpose: "継続的に覚えるべきユーザー情報を更新する。",
-        required: ["user_id"],
-      },
-      {
-        type: "fetch_user_recent_logs",
-        purpose: "特定ユーザーの過去発話を取得する。",
-        required: ["user_id"],
-      },
-      {
-        type: "fetch_user_avatar_context",
-        purpose: "ユーザーアイコンや画像特徴を取得する。",
-        required: ["user_id"],
-      },
-      {
-        type: "write_core_memory",
-        purpose: "重要で継続的に覚えるべき情報だけを書く。",
-        required: ["body"],
-      },
-      {
-        type: "none",
-        purpose: "本当に何もしない。",
-        required: [],
-      },
-    ],
-    null,
-    2,
-  );
+  return [
+    "discord_send_message: 返信/催促/確認/成果物/結果報告。required target_channel_id, content。",
+    "discord_add_reaction: 文なしの短い反応。required target_channel_id, target_message_id, emoji。",
+    "nest_stash: 供物を巣へ保存。required name, quantity。",
+    "nest_consume: 巣の物を食べる/使う。required item_id or name, quantity, reason。",
+    "nest_look: 巣の中身確認。巣の確認では供物を要求せず、まずこの tool で文脈を取る。",
+    "update_user_profile: 継続的ユーザー情報更新。",
+    "fetch_user_recent_logs/fetch_user_avatar_context: 追加文脈取得。",
+    "write_core_memory: 重要な長期記憶だけ保存。",
+    "none: 本当に何もしない時だけ。雑談返信が必要なら使わない。",
+  ].join("\n");
 }
 
 function buildConversationFocus(trigger: WedgePromptContext["trigger"], logs: WedgeShortTermLog[]) {
@@ -199,11 +151,6 @@ function buildSalientFacts(logs: WedgeShortTermLog[], nestItems: Array<{ name: s
   }
   if (previous) {
     facts.push(`直近発話: ${previous.userName ?? previous.userId ?? "unknown"}: ${truncateForPrompt(previous.content, 160)}`);
-  }
-  for (const log of logs.slice(-8)) {
-    if (/あげる|渡す|やる|供物|奢る/.test(log.content)) {
-      facts.push(`供物らしい発話: ${log.userName ?? log.userId ?? "unknown"} が「${truncateForPrompt(log.content, 120)}」と言った。`);
-    }
   }
   for (const item of nestItems) {
     if (item.quantity > 0) {

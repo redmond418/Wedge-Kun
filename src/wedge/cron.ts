@@ -1,7 +1,6 @@
 import cron from "node-cron";
 import { executeWedgeAction } from "./actions.js";
 import { generateWedgeOllamaDecision } from "./ollama.js";
-import { buildWedgeSystemPrompt } from "./prompt.js";
 import { openWedgeDatabase } from "./storage.js";
 
 const MEMORY_BATCH_CHANNEL_ID = "wedge-memory-batch";
@@ -18,36 +17,31 @@ export async function runWedgeMemoryRecovery() {
       triggerMessageId: `memory-batch-${Date.now()}`,
       channelId: MEMORY_BATCH_CHANNEL_ID,
     });
-    const prompt = buildWedgeSystemPrompt({
-      db,
-      context: {
-        iteration: 1,
-        recentLogs: logs,
-        trigger: {
-          kind: "memory_batch",
-          channelId: MEMORY_BATCH_CHANNEL_ID,
-          text: [
-            "短期ログを整理する。",
-            "重要な継続情報だけを core memory、users.details、channels.purpose、nest notes に統合する。",
-            "生ログの連結を core memory に書いてはいけない。",
-          ].join("\n"),
-        },
-      },
-    });
+    const prompt = buildMemoryBatchPrompt();
     const decision = await generateWedgeOllamaDecision({
       systemPrompt: prompt,
-      userText: "短期ログから長期記憶へ統合する JSON action を返すこと。",
+      userText: JSON.stringify({
+        task: "memory_batch",
+        rules: [
+          "短期ログから重要な継続情報だけを抽出する",
+          "生ログをそのまま長期記憶に連結しない",
+          "Discord送信や供物要求は絶対にしない",
+        ],
+        core_memory: db.getCoreMemoryText(),
+        logs,
+      }),
+      fallbackChannelId: MEMORY_BATCH_CHANNEL_ID,
     });
     db.insertCognitionStep({ runId, iteration: 1, prompt, decision });
     let actionCount = 0;
     for (const action of decision.actions) {
-      if (action.type === "discord_send_message" || action.type === "discord_add_reaction") {
+      if (!isAllowedMemoryBatchAction(action.type)) {
         db.insertCognitionStep({
           runId,
           iteration: 1,
           prompt,
           action,
-          resultJson: JSON.stringify({ skipped: "memory batch cannot send discord actions" }),
+          resultJson: JSON.stringify({ skipped: "memory batch cannot run conversational actions" }),
         });
         continue;
       }
@@ -67,6 +61,21 @@ export async function runWedgeMemoryRecovery() {
   } finally {
     db.close();
   }
+}
+
+function buildMemoryBatchPrompt() {
+  return [
+    "You are an internal Wedge memory consolidation function.",
+    "Return exactly one WedgeDecision JSON object.",
+    "This is not a user conversation. Do not roleplay. Do not ask for offerings. Do not send Discord messages.",
+    "Allowed actions: write_core_memory, update_user_profile, nest_update, none.",
+    "Use request_level=0, offering.present=false, triage=continue, continue_loop=false.",
+    "thought_summary must be one short Japanese sentence describing the memory update.",
+  ].join("\n");
+}
+
+function isAllowedMemoryBatchAction(type: string) {
+  return type === "write_core_memory" || type === "update_user_profile" || type === "nest_update" || type === "none";
 }
 
 export function startWedgeDailyMemoryBatch() {

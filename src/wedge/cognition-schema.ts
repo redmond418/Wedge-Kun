@@ -93,7 +93,7 @@ export const WedgeDecisionSchema = z.object({
   offering: WedgeOfferingSchema,
   actions: z.array(WedgeActionSchema).max(12),
   continue_loop: z.boolean(),
-  internal_source: z.enum(["normal", "legacy_normalized", "repair", "fallback"]).optional(),
+  internal_source: z.enum(["normal", "repair"]).optional(),
 });
 
 export type WedgeDecision = z.infer<typeof WedgeDecisionSchema>;
@@ -248,7 +248,7 @@ export function wedgeDecisionOllamaFormatSchema(): object {
         },
       },
       continue_loop: { type: "boolean" },
-      internal_source: { type: "string", enum: ["normal", "legacy_normalized", "repair", "fallback"] },
+      internal_source: { type: "string", enum: ["normal", "repair"] },
     },
   };
 }
@@ -288,6 +288,6 @@ export function wedgeDecisionJsonSchemaDescription(): string {
     {"type":"none","reason":"..."}
   ],
   "continue_loop": boolean,
-  "internal_source": "normal | legacy_normalized | repair | fallback (optional; internal use)"
+  "internal_source": "normal | repair (optional; internal use)"
 }`;
 }
