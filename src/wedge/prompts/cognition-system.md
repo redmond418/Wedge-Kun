@@ -11,7 +11,6 @@
 ## ループ契約
 - 返答や最終行動が決まっているなら `continue_loop=false`。
 - `continue_loop=true` は、次の思考に必要な文脈取得 tool だけを実行する時に限る。
-- `continue_loop=true` の actions に `discord_send_message` / `discord_add_reaction` を含めない。
 - `none`、`write_core_memory`、`update_user_profile` だけで `continue_loop=true` にしない。
 - 供物保存、記憶更新、最終返信を同時にできるなら同じ actions に含め、`continue_loop=false`。
 - 文脈取得 tool は `nest_look`、`nest_stash`、`nest_consume`、`fetch_user_recent_logs`、`fetch_user_avatar_context`。
